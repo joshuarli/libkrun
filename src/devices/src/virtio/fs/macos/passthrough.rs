@@ -2525,4 +2525,38 @@ impl FileSystem for PassthroughFs {
 
         Ok(())
     }
+
+    fn ioctl(
+        &self,
+        _ctx: Context,
+        _inode: Self::Inode,
+        _handle: Self::Handle,
+        _flags: u32,
+        cmd: u32,
+        arg: u64,
+        _in_size: u32,
+        _out_size: u32,
+        exit_code: &Arc<AtomicI32>,
+    ) -> io::Result<Vec<u8>> {
+        // We can't use nix::request_code_none here since it's system-dependent
+        // and we need the value from Linux.
+        const VIRTIO_IOC_EXIT_CODE_REQ: u32 = 0x7602;
+        const VIRTIO_IOC_REMOVE_ROOT_DIR_REQ: u32 = 0x7603;
+
+        match cmd {
+            VIRTIO_IOC_EXIT_CODE_REQ => {
+                exit_code.store(arg as i32, Ordering::SeqCst);
+                Ok(Vec::new())
+            }
+            VIRTIO_IOC_REMOVE_ROOT_DIR_REQ if self.cfg.allow_root_dir_delete => {
+                std::fs::remove_dir_all(&self.cfg.root_dir)?;
+                Ok(Vec::new())
+            }
+            // For FS_IOC_GETFLAGS (used by overlayfs copy-up): return zero flags
+            // instead of an error. macOS doesn't support Linux file attributes, so
+            // report "no flags set" which lets overlayfs proceed normally.
+            // Returning EOPNOTSUPP/ENOTSUPP causes overlayfs copy-up to fail.
+            _ => Ok(vec![0u8; std::mem::size_of::<u32>()]),
+        }
+    }
 }
