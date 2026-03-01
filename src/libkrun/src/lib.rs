@@ -166,6 +166,7 @@ struct ContextConfig {
     rlimits: Option<String>,
     net_index: u8,
     tsi_port_map: Option<HashMap<u16, u16>>,
+    egress_cidrs: Option<Vec<(std::net::IpAddr, u8)>>,
     vsock_config: VsockConfig,
     #[cfg(feature = "blk")]
     block_cfgs: Vec<BlockDeviceConfig>,
@@ -1074,6 +1075,79 @@ pub unsafe extern "C" fn krun_set_port_map(ctx_id: u32, c_port_map: *const *cons
                 if cfg.set_port_map(port_map).is_err() {
                     return -libc::EINVAL;
                 }
+            }
+            Entry::Vacant(_) => return -libc::ENOENT,
+        }
+
+        KRUN_SUCCESS
+    }
+}
+
+/// Set the egress policy for TSI networking.
+///
+/// Accepts a null-terminated array of CIDR strings (e.g., "10.0.0.0/8", "1.1.1.1/32").
+/// When set, only outbound connections to matching IP ranges are allowed.
+/// Bare IPs without a prefix are treated as /32 (IPv4) or /128 (IPv6).
+#[allow(clippy::missing_safety_doc)]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn krun_set_egress_policy(ctx_id: u32, c_cidrs: *const *const c_char) -> i32 {
+    use std::net::IpAddr;
+
+    unsafe {
+        let cidrs = if c_cidrs.is_null() {
+            return -libc::EINVAL;
+        } else {
+            let mut parsed = Vec::new();
+            let array: &[*const c_char] = slice::from_raw_parts(c_cidrs, MAX_ARGS);
+            for item in array.iter().take(MAX_ARGS) {
+                if item.is_null() {
+                    break;
+                }
+                let s = match CStr::from_ptr(*item).to_str() {
+                    Ok(s) => s,
+                    Err(_) => return -libc::EINVAL,
+                };
+
+                // Parse "IP/prefix" or bare "IP"
+                let (ip_str, prefix_len) = if let Some((ip_part, prefix_part)) = s.split_once('/') {
+                    let prefix: u8 = match prefix_part.parse() {
+                        Ok(p) => p,
+                        Err(_) => return -libc::EINVAL,
+                    };
+                    (ip_part, prefix)
+                } else {
+                    // Bare IP — detect v4 vs v6
+                    if s.contains(':') {
+                        (s, 128u8)
+                    } else {
+                        (s, 32u8)
+                    }
+                };
+
+                let ip: IpAddr = match ip_str.parse() {
+                    Ok(ip) => ip,
+                    Err(_) => return -libc::EINVAL,
+                };
+
+                // Validate prefix length
+                match ip {
+                    IpAddr::V4(_) if prefix_len > 32 => return -libc::EINVAL,
+                    IpAddr::V6(_) if prefix_len > 128 => return -libc::EINVAL,
+                    _ => {}
+                }
+
+                parsed.push((ip, prefix_len));
+            }
+            parsed
+        };
+
+        match CTX_MAP.lock().unwrap().entry(ctx_id) {
+            Entry::Occupied(mut ctx_cfg) => {
+                let cfg = ctx_cfg.get_mut();
+                if cfg.vsock_config == VsockConfig::Disabled {
+                    return -libc::ENODEV;
+                }
+                cfg.egress_cidrs = Some(cidrs);
             }
             Entry::Vacant(_) => return -libc::ENOENT,
         }
@@ -2902,6 +2976,8 @@ pub extern "C" fn krun_start_enter(ctx_id: u32) -> i32 {
         return -libc::EINVAL;
     }
 
+    let egress_cidrs = ctx_cfg.egress_cidrs.take();
+
     match &ctx_cfg.vsock_config {
         VsockConfig::Disabled => (),
         VsockConfig::Explicit { tsi_flags } => {
@@ -2911,6 +2987,7 @@ pub extern "C" fn krun_start_enter(ctx_id: u32) -> i32 {
                 host_port_map: ctx_cfg.tsi_port_map,
                 unix_ipc_port_map: ctx_cfg.unix_ipc_port_map.clone(),
                 tsi_flags: *tsi_flags,
+                egress_cidrs: egress_cidrs.clone(),
             };
             ctx_cfg.vmr.set_vsock_device(vsock_device_config).unwrap();
         }
