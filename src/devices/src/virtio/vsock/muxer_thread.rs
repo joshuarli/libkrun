@@ -154,8 +154,10 @@ impl MuxerThread {
 
     fn create_lisening_ipc_sockets(&self) {
         let start = std::time::Instant::now();
-        info!("[VSOCK_TIMING] create_lisening_ipc_sockets() called, {} ports to create",
-              self.unix_ipc_port_map.len());
+        info!(
+            "[VSOCK_TIMING] create_lisening_ipc_sockets() called, {} ports to create",
+            self.unix_ipc_port_map.len()
+        );
 
         for (port, (path, do_listen)) in &self.unix_ipc_port_map {
             if !do_listen {
@@ -164,12 +166,18 @@ impl MuxerThread {
             }
             let proxy_start = std::time::Instant::now();
             let id = ((*port as u64) << 32) | (defs::TSI_PROXY_PORT as u64);
-            info!("[VSOCK_TIMING] creating UnixAcceptorProxy for port {} at {:?}", port, path);
+            info!(
+                "[VSOCK_TIMING] creating UnixAcceptorProxy for port {} at {:?}",
+                port, path
+            );
 
             let proxy = match UnixAcceptorProxy::new(id, path, *port) {
                 Ok(proxy) => {
-                    info!("[VSOCK_TIMING] UnixAcceptorProxy created for port {} in {:?}",
-                          port, proxy_start.elapsed());
+                    info!(
+                        "[VSOCK_TIMING] UnixAcceptorProxy created for port {} in {:?}",
+                        port,
+                        proxy_start.elapsed()
+                    );
                     proxy
                 }
                 Err(e) => {
@@ -187,7 +195,10 @@ impl MuxerThread {
             info!("[VSOCK_TIMING] port {} registered with epoll", port);
         }
 
-        info!("[VSOCK_TIMING] create_lisening_ipc_sockets() completed in {:?}", start.elapsed());
+        info!(
+            "[VSOCK_TIMING] create_lisening_ipc_sockets() completed in {:?}",
+            start.elapsed()
+        );
     }
 
     fn work(mut self) {
@@ -197,7 +208,10 @@ impl MuxerThread {
         let mut thread_rng = rng();
         self.create_lisening_ipc_sockets();
 
-        info!("[VSOCK_TIMING] MuxerThread entering epoll loop after {:?}", work_start.elapsed());
+        info!(
+            "[VSOCK_TIMING] MuxerThread entering epoll loop after {:?}",
+            work_start.elapsed()
+        );
 
         let mut epoll_events = vec![EpollEvent::new(EventSet::empty(), 0); 32];
         let mut first_event = true;
@@ -222,8 +236,10 @@ impl MuxerThread {
 
                         // Log connection-related events
                         if event_count <= 10 {
-                            info!("[VSOCK_TIMING] processing event #{}: id={:#x} evset={:?}",
-                                  event_count, id, evset);
+                            info!(
+                                "[VSOCK_TIMING] processing event #{}: id={:#x} evset={:?}",
+                                event_count, id, evset
+                            );
                         }
 
                         let update = self.proxy_map.read().unwrap().get(&id).map(|proxy_lock| {

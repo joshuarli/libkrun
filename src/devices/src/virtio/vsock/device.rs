@@ -60,7 +60,13 @@ impl Vsock {
     ) -> super::Result<Vsock> {
         Ok(Vsock {
             cid,
-            muxer: VsockMuxer::new(cid, host_port_map, unix_ipc_port_map, tsi_flags, egress_cidrs),
+            muxer: VsockMuxer::new(
+                cid,
+                host_port_map,
+                unix_ipc_port_map,
+                tsi_flags,
+                egress_cidrs,
+            ),
             queue_rx: None,
             queue_tx: None,
             queue_events: Vec::new(),
@@ -275,7 +281,10 @@ impl VirtioDevice for Vsock {
 
         self.device_state = DeviceState::Activated(mem, interrupt);
 
-        info!("[VSOCK_TIMING] device.activate() completed in {:?}", activate_start.elapsed());
+        info!(
+            "[VSOCK_TIMING] device.activate() completed in {:?}",
+            activate_start.elapsed()
+        );
         Ok(())
     }
 
