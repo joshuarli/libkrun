@@ -1141,7 +1141,11 @@ pub unsafe extern "C" fn krun_set_egress_policy(ctx_id: u32, c_cidrs: *const *co
 
         let cidrs = parsed;
 
-        match CTX_MAP.lock().unwrap().entry(ctx_id) {
+        let mut map = match CTX_MAP.lock() {
+            Ok(map) => map,
+            Err(_) => return -libc::EINVAL,
+        };
+        match map.entry(ctx_id) {
             Entry::Occupied(mut ctx_cfg) => {
                 let cfg = ctx_cfg.get_mut();
                 if cfg.vsock_config == VsockConfig::Disabled {

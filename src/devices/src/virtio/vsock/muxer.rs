@@ -133,12 +133,10 @@ fn ip_matches_cidrs(addr: &SockaddrStorage, cidrs: &[(IpAddr, u8)]) -> bool {
     for (cidr_ip, prefix_len) in cidrs {
         match (ip, cidr_ip) {
             (IpAddr::V4(addr_v4), IpAddr::V4(cidr_v4)) => {
-                let mask = if *prefix_len == 0 {
-                    0u32
-                } else if *prefix_len >= 32 {
-                    u32::MAX
-                } else {
-                    u32::MAX << (32 - prefix_len)
+                let mask = match *prefix_len {
+                    0 => 0u32,
+                    p if p >= 32 => u32::MAX,
+                    _ => u32::MAX << (32 - prefix_len),
                 };
                 let addr_bits = u32::from(addr_v4);
                 let cidr_bits = u32::from(*cidr_v4);
@@ -147,12 +145,10 @@ fn ip_matches_cidrs(addr: &SockaddrStorage, cidrs: &[(IpAddr, u8)]) -> bool {
                 }
             }
             (IpAddr::V6(addr_v6), IpAddr::V6(cidr_v6)) => {
-                let mask = if *prefix_len == 0 {
-                    0u128
-                } else if *prefix_len >= 128 {
-                    u128::MAX
-                } else {
-                    u128::MAX << (128 - prefix_len)
+                let mask = match *prefix_len {
+                    0 => 0u128,
+                    p if p >= 128 => u128::MAX,
+                    _ => u128::MAX << (128 - prefix_len),
                 };
                 let addr_bits = u128::from(addr_v6);
                 let cidr_bits = u128::from(*cidr_v6);
