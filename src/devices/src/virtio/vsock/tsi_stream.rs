@@ -937,8 +937,14 @@ impl Proxy for TsiStreamProxy {
                     Ok(accept_fd) => {
                         // Safe because we've just obtained the FD from the `accept` call above.
                         let new_fd = unsafe { OwnedFd::from_raw_fd(accept_fd) };
+                        // Use the original vsock ephemeral port (encoded in the high 32 bits of
+                        // self.id) rather than self.peer_port, which listen() overwrites with the
+                        // VM TCP port (e.g. 9222).  push_op_request() sends an OP_REQUEST to the
+                        // guest on this port; the guest TSI layer must have a vsock socket there,
+                        // not a plain TCP port.
+                        let vsock_peer_port = (self.id >> 32) as u32;
                         update.new_proxy =
-                            Some((self.peer_port, new_fd, self.family, NewProxyType::Tcp));
+                            Some((vsock_peer_port, new_fd, self.family, NewProxyType::Tcp));
                     }
                     Err(e) => warn!("error accepting connection: id={}, err={}", self.id, e),
                 };

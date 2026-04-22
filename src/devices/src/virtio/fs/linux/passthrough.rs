@@ -834,11 +834,16 @@ impl FileSystem for PassthroughFs {
         // Safe because this doesn't modify any memory and we check the return value.
         // We use `O_PATH` because we just want this for traversing the directory tree
         // and not for actually reading the contents.
+        // Note: O_NOFOLLOW is intentionally omitted — the root dir may be a symlink
+        // (e.g. a cache entry pointing to the real rootfs directory). O_PATH | O_NOFOLLOW
+        // on a symlink succeeds on Linux (unlike macOS) but gives a symlink fd; statx()
+        // on a symlink fd returns the symlink's inode/dev rather than the target's,
+        // corrupting the FUSE root inode table entry.
         let fd = unsafe {
             libc::openat(
                 libc::AT_FDCWD,
                 root.as_ptr(),
-                libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                libc::O_PATH | libc::O_CLOEXEC,
             )
         };
         if fd < 0 {

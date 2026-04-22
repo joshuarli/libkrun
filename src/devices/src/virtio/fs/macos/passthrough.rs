@@ -579,11 +579,16 @@ impl PassthroughFs {
         let root = CString::new(cfg.root_dir.as_str()).expect("CString::new failed");
 
         // Safe because this doesn't modify any memory and we check the return value.
+        // Note: O_NOFOLLOW is intentionally omitted here — the root dir is explicitly
+        // provided by the caller and may be a symlink (e.g. a dev symlink to a cached
+        // rootfs).  O_NOFOLLOW on the final path component would return ELOOP, which
+        // linux_error maps to Linux errno 40, which macOS strerror then mis-formats as
+        // "Message too long" (EMSGSIZE) causing a confusing BadActivate panic.
         let fd = unsafe {
             libc::openat(
                 libc::AT_FDCWD,
                 root.as_ptr(),
-                libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                libc::O_CLOEXEC,
             )
         };
         if fd < 0 {
@@ -1097,13 +1102,15 @@ impl FileSystem for PassthroughFs {
         let root = CString::new(self.cfg.root_dir.as_str()).expect("CString::new failed");
 
         // Safe because this doesn't modify any memory and we check the return value.
-        // We use `O_PATH` because we just want this for traversing the directory tree
-        // and not for actually reading the contents.
+        // Note: O_NOFOLLOW is intentionally omitted — the root dir may be a symlink
+        // (e.g. a dev symlink to a cached rootfs). O_NOFOLLOW on the final path
+        // component returns ELOOP, which causes the FUSE session init to fail, which
+        // causes the guest to be unable to mount its rootfs.
         let fd = unsafe {
             libc::openat(
                 libc::AT_FDCWD,
                 root.as_ptr(),
-                libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                libc::O_CLOEXEC,
             )
         };
         if fd < 0 {
