@@ -97,6 +97,24 @@ pub trait RutabagaComponent {
         None
     }
 
+    /// Poll a specific virglrenderer context for pending completions.
+    ///
+    /// In render server mode, `virgl_renderer_get_poll_fd()` returns -1 (no global
+    /// poll fd), so the global `event_poll()` is a no-op for fence signaling.  Instead,
+    /// each context has its own poll fd, and calling this function processes pending
+    /// responses from the render server for the given context, triggering
+    /// `write_context_fence` callbacks and unblocking the guest.
+    fn context_event_poll(&self, _ctx_id: u32) {}
+
+    /// Returns an epollable fd for per-context render-server completions.
+    ///
+    /// When the returned fd becomes readable (EPOLLIN), the caller should invoke
+    /// `context_event_poll(ctx_id)` to process pending responses.  Returns `None`
+    /// if the component does not support per-context poll fds.
+    fn context_poll_fd(&self, _ctx_id: u32) -> Option<i32> {
+        None
+    }
+
     /// Implementations must create a resource with the given metadata.  For 2D rutabaga components,
     /// this a system memory allocation.  For 3D components, this is typically a GL texture or
     /// buffer.  Vulkan components should use blob resources instead.
@@ -584,6 +602,24 @@ impl Rutabaga {
     pub fn poll_descriptor(&self) -> Option<SafeDescriptor> {
         let component = self.components.get(&self.default_component).or(None)?;
         component.poll_descriptor()
+    }
+
+    /// Polls a specific context on the default rutabaga component.
+    ///
+    /// In render server mode, virglrenderer uses per-context poll fds rather than the
+    /// global one (which returns -1).  Calling this function processes pending render-server
+    /// responses for the given context and triggers `write_context_fence` callbacks.
+    pub fn context_event_poll(&self, ctx_id: u32) {
+        if let Some(component) = self.components.get(&self.default_component) {
+            component.context_event_poll(ctx_id);
+        }
+    }
+
+    /// Returns an epollable fd for per-context render-server completions, or None.
+    pub fn context_poll_fd(&self, ctx_id: u32) -> Option<i32> {
+        self.components
+            .get(&self.default_component)
+            .and_then(|c| c.context_poll_fd(ctx_id))
     }
 
     /// Creates a resource with the `resource_create_3d` metadata.

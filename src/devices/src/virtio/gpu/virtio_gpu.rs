@@ -28,14 +28,14 @@ use rutabaga_gfx::RUTABAGA_MEM_HANDLE_TYPE_OPAQUE_FD;
 use rutabaga_gfx::RUTABAGA_MEM_HANDLE_TYPE_SHM;
 #[cfg(target_os = "linux")]
 use rutabaga_gfx::{
-    RutabagaDescriptor, RutabagaFromRawDescriptor, RUTABAGA_CHANNEL_TYPE_PW,
-    RUTABAGA_CHANNEL_TYPE_X11, RUTABAGA_MAP_ACCESS_MASK, RUTABAGA_MAP_ACCESS_READ,
-    RUTABAGA_MAP_ACCESS_RW, RUTABAGA_MAP_ACCESS_WRITE,
+    RutabagaFromRawDescriptor, RUTABAGA_CHANNEL_TYPE_PW, RUTABAGA_CHANNEL_TYPE_X11,
+    RUTABAGA_MAP_ACCESS_MASK, RUTABAGA_MAP_ACCESS_READ, RUTABAGA_MAP_ACCESS_RW,
+    RUTABAGA_MAP_ACCESS_WRITE,
 };
 use rutabaga_gfx::{
     RUTABAGA_CHANNEL_TYPE_WAYLAND, RUTABAGA_MAP_CACHE_MASK, ResourceCreate3D, ResourceCreateBlob,
-    Rutabaga, RutabagaBuilder, RutabagaChannel, RutabagaFence, RutabagaFenceHandler, RutabagaIovec,
-    Transfer3D,
+    Rutabaga, RutabagaBuilder, RutabagaChannel, RutabagaDescriptor, RutabagaFence,
+    RutabagaFenceHandler, RutabagaIovec, Transfer3D,
 };
 #[cfg(target_os = "macos")]
 use utils::worker_message::WorkerMessage;
@@ -262,17 +262,66 @@ impl VirtioGpu {
         // server_fd: intentionally no CLOEXEC — the subprocess needs it.
 
         let server_fd_str = server_fd.to_string();
+
+        // When SMOLVM_GPU_DEBUG is set, redirect the render server's stderr to
+        // a debug log file so we can see Vulkan loader / driver messages.
+        let stderr_stdio = if std::env::var_os("SMOLVM_GPU_DEBUG").is_some() {
+            let log_path = std::env::temp_dir().join("virgl_render_server.log");
+            std::fs::OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .open(&log_path)
+                .map(|f| {
+                    info!("virgl_render_server stderr → {}", log_path.display());
+                    std::process::Stdio::from(f)
+                })
+                .unwrap_or_else(|_| std::process::Stdio::null())
+        } else {
+            std::process::Stdio::null()
+        };
+
+        // exec-ready pipe: both fds have O_CLOEXEC.  The child inherits
+        // exec_write_fd across fork; the kernel closes it on exec().  The
+        // parent's read(exec_read_fd) blocks until that happens, giving a
+        // deterministic exec-completed signal before the Vulkan-init sleep.
+        let mut exec_pipe_fds: [libc::c_int; 2] = [-1, -1];
+        let pipe_ok =
+            unsafe { libc::pipe2(exec_pipe_fds.as_mut_ptr(), libc::O_CLOEXEC) } == 0;
+        if !pipe_ok {
+            warn!(
+                "pipe2 for exec-ready detection failed: {}; \
+                 falling back to fixed-duration sleep before Vulkan init",
+                std::io::Error::last_os_error()
+            );
+        }
+        let (exec_read_fd, exec_write_fd) = if pipe_ok {
+            (exec_pipe_fds[0], exec_pipe_fds[1])
+        } else {
+            (-1, -1)
+        };
+
+        let mut spawn_cmd = std::process::Command::new(&server_path);
+        spawn_cmd
+            .arg("--socket-fd")
+            .arg(&server_fd_str)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(stderr_stdio);
+        if std::env::var_os("SMOLVM_GPU_DEBUG").is_some() {
+            spawn_cmd.env("VK_LOADER_DEBUG", "all");
+        }
         let spawn_result = unsafe {
-            std::process::Command::new(&server_path)
-                .arg("--socket-fd")
-                .arg(&server_fd_str)
-                .stdin(std::process::Stdio::null())
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
+            spawn_cmd
                 .pre_exec(move || {
                     // In the child after fork, before exec: explicitly clear
                     // CLOEXEC on server_fd in case the Rust stdlib set it.
                     libc::fcntl(server_fd, libc::F_SETFD, 0);
+                    // Close read end — child does not need it.
+                    if exec_read_fd >= 0 {
+                        libc::close(exec_read_fd);
+                    }
+                    // exec_write_fd is O_CLOEXEC; kernel closes it on exec().
                     Ok(())
                 })
                 .spawn()
@@ -280,15 +329,37 @@ impl VirtioGpu {
 
         // Close server_fd in the parent — the child has its own copy.
         unsafe { libc::close(server_fd) };
+        // Parent closes write end; child's copy is the only one remaining.
+        if exec_write_fd >= 0 {
+            unsafe { libc::close(exec_write_fd) };
+        }
 
         match spawn_result {
             Ok(_child) => {
+                // Wait for exec: read blocks until child's exec_write_fd is closed
+                // by the kernel on exec(), confirming the server binary has been
+                // loaded.  No additional sleep is needed: the SOCK_SEQPACKET
+                // socketpair is blocking, so virglrenderer's first message to the
+                // server will block in recvmsg() until the server's event loop
+                // processes it and responds.  If virglrenderer init still fails
+                // (e.g., non-blocking I/O path), create_rutabaga retries with
+                // exponential backoff.
+                if exec_read_fd >= 0 {
+                    let mut buf = [0u8; 1];
+                    unsafe {
+                        libc::read(exec_read_fd, buf.as_mut_ptr() as *mut libc::c_void, 1)
+                    };
+                    unsafe { libc::close(exec_read_fd) };
+                }
                 // The server runs as an orphaned subprocess; dropping `_child`
                 // here does NOT kill it.  It will be reparented to PID 1 when
                 // this process exits and will be reaped there.
                 Some(unsafe { RutabagaDescriptor::from_raw_descriptor(client_fd) })
             }
             Err(e) => {
+                if exec_read_fd >= 0 {
+                    unsafe { libc::close(exec_read_fd) };
+                }
                 warn!("failed to start virgl_render_server: {e}");
                 unsafe { libc::close(client_fd) };
                 None
@@ -360,12 +431,8 @@ impl VirtioGpu {
         let fence =
             Self::create_fence_handler(mem, queue_ctl.clone(), fence_state.clone(), interrupt);
 
-        // Venus (Vulkan-over-virtio) requires a render server subprocess.
-        // Start it now so that virglrenderer's `get_server_fd` callback can
-        // return a valid socket fd during `virgl_renderer_init`.
         #[cfg(target_os = "linux")]
         let render_server_fd = if virgl_flags & (1 << 6) != 0 {
-            // VIRGLRENDERER_VENUS bit is set — start the server.
             Self::start_render_server()
         } else {
             None
@@ -373,7 +440,63 @@ impl VirtioGpu {
         #[cfg(not(target_os = "linux"))]
         let render_server_fd: Option<rutabaga_gfx::RutabagaDescriptor> = None;
 
-        builder.clone().build(fence.clone(), render_server_fd).ok()
+        // When using a render server, the first build() attempt may fail if
+        // the server hasn't finished its Vulkan init yet.  Retry with
+        // exponential backoff instead of a fixed sleep: this adapts to
+        // fast and slow systems, and success means the server is actually
+        // responding — no magic numbers.
+        #[cfg(target_os = "linux")]
+        let has_render_server = render_server_fd.is_some();
+
+        // Dup the fd so we can retry if the first attempt fails (build()
+        // consumes the fd by moving it into the virglrenderer cookie).
+        #[cfg(target_os = "linux")]
+        let retry_fds: Vec<RutabagaDescriptor> = if has_render_server {
+            render_server_fd
+                .as_ref()
+                .map(|fd| {
+                    let mut fds = Vec::new();
+                    // Backoff schedule: 10ms, 50ms, 200ms.  Total worst-case
+                    // wait ≈ 260ms, similar to the old fixed 300ms but adaptive.
+                    for _ in 0..3 {
+                        match fd.try_clone() {
+                            Ok(dup) => fds.push(dup),
+                            Err(_) => break,
+                        }
+                    }
+                    fds
+                })
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+
+        if let Ok(rutabaga) = builder.clone().build(fence.clone(), render_server_fd) {
+            return Some(rutabaga);
+        }
+
+        #[cfg(target_os = "linux")]
+        if has_render_server {
+            const BACKOFF_NS: [i64; 3] = [10_000_000, 50_000_000, 200_000_000];
+            for (i, retry_fd) in retry_fds.into_iter().enumerate() {
+                let ns = BACKOFF_NS.get(i).copied().unwrap_or(200_000_000);
+                warn!(
+                    "virglrenderer init failed; retrying after {}ms...",
+                    ns / 1_000_000
+                );
+                unsafe {
+                    libc::nanosleep(
+                        &libc::timespec { tv_sec: 0, tv_nsec: ns },
+                        std::ptr::null_mut(),
+                    );
+                }
+                if let Ok(rutabaga) = builder.clone().build(fence.clone(), Some(retry_fd)) {
+                    return Some(rutabaga);
+                }
+            }
+        }
+
+        None
     }
 
     pub fn create_fallback_rutabaga(
@@ -469,6 +592,43 @@ impl VirtioGpu {
 
     pub fn force_ctx_0(&self) {
         self.rutabaga.force_ctx_0()
+    }
+
+    /// Polls the virglrenderer component for pending events.
+    ///
+    /// Call this when the poll descriptor becomes readable so that render-server
+    /// responses are processed and fence callbacks fire, unblocking the guest.
+    pub fn event_poll(&self) {
+        self.rutabaga.event_poll();
+    }
+
+    /// Returns a descriptor that becomes readable when virglrenderer has pending
+    /// events (render-server responses ready to be relayed to the guest).
+    ///
+    /// Returns `None` when virglrenderer is not the active component or when
+    /// `virgl_renderer_get_poll_fd()` returns -1.
+    pub fn poll_descriptor(&self) -> Option<RutabagaDescriptor> {
+        self.rutabaga.poll_descriptor()
+    }
+
+    /// Poll a specific virglrenderer context for pending completions.
+    ///
+    /// In render server mode, virglrenderer's global poll fd returns -1, so
+    /// `event_poll()` has no effect on fence signaling.  Calling this for each
+    /// active Venus context ID processes render-server responses and fires
+    /// `write_context_fence` callbacks, advancing the seqno that Venus's cpu sync waits on.
+    pub fn context_event_poll(&self, ctx_id: u32) {
+        self.rutabaga.context_event_poll(ctx_id);
+    }
+
+    /// Returns an epollable fd for per-context render-server completions.
+    ///
+    /// When `Some(fd)` is returned, the fd fires EPOLLIN when the render server
+    /// has completed work for this context.  Register it with epoll and call
+    /// `context_event_poll(ctx_id)` on the event.  Returns `None` if virglrenderer
+    /// does not provide a per-context poll fd for this context.
+    pub fn context_poll_fd(&self, ctx_id: u32) -> Option<i32> {
+        self.rutabaga.context_poll_fd(ctx_id)
     }
 
     /// Creates a 3D resource with the given properties and resource_id.

@@ -1,3 +1,5 @@
+#[cfg(target_os = "linux")]
+use std::collections::HashMap;
 use std::io::Read;
 use std::os::fd::{AsRawFd, BorrowedFd};
 use std::sync::{Arc, Mutex};
@@ -8,6 +10,8 @@ use utils::eventfd::EventFd;
 
 #[cfg(target_os = "macos")]
 use crossbeam_channel::Sender;
+#[cfg(target_os = "linux")]
+use rutabaga_gfx::AsRawDescriptor;
 use rutabaga_gfx::{
     RUTABAGA_PIPE_BIND_RENDER_TARGET, RUTABAGA_PIPE_TEXTURE_2D, ResourceCreate3D,
     ResourceCreateBlob, RutabagaFence, Transfer3D,
@@ -42,6 +46,23 @@ pub struct Worker {
     export_table: Option<ExportTable>,
     displays: Box<[DisplayInfo]>,
     display_backend: DisplayBackend<'static>,
+    /// Per-context poll fds, populated on CtxCreate.
+    /// `Some(fd)` — epollable fd returned by virgl_renderer_context_get_poll_fd.
+    /// `None`     — virglrenderer returned -1; context is blind-polled each tick.
+    ///
+    /// SAFETY: accessed only from the single GPU worker thread; no locking needed.
+    /// The fds are owned by virglrenderer — do NOT close them.
+    #[cfg(target_os = "linux")]
+    context_poll_fds: HashMap<u32, Option<i32>>,
+    /// Context IDs whose poll fds need registering with epoll.
+    /// Populated by CtxCreate, drained after process_queue.
+    #[cfg(target_os = "linux")]
+    pending_ctx_registrations: Vec<u32>,
+    /// The epoll instance for this worker, set once in `work_loop_epoll`.
+    /// Stored on the struct so `CtxDestroy` can deregister fds before the
+    /// virglrenderer context (and its fd) is destroyed.
+    #[cfg(target_os = "linux")]
+    epoll_fd: i32,
 }
 
 impl Worker {
@@ -77,6 +98,12 @@ impl Worker {
             export_table,
             displays,
             display_backend,
+            #[cfg(target_os = "linux")]
+            context_poll_fds: HashMap::new(),
+            #[cfg(target_os = "linux")]
+            pending_ctx_registrations: Vec::new(),
+            #[cfg(target_os = "linux")]
+            epoll_fd: -1,
         }
     }
 
@@ -100,6 +127,167 @@ impl Worker {
             self.display_backend,
         );
 
+        #[cfg(target_os = "linux")]
+        self.work_loop_epoll(&mut virtio_gpu);
+
+        #[cfg(not(target_os = "linux"))]
+        self.work_loop_blocking(&mut virtio_gpu);
+    }
+
+    /// Linux GPU worker loop: uses epoll to multiplex the virtio control eventfd,
+    /// the virglrenderer global poll fd, and per-context render-server poll fds.
+    ///
+    /// Per-context fds (from `virgl_renderer_context_get_poll_fd`) fire when the
+    /// render server has completed work for a context.  We call `context_event_poll`
+    /// on the firing context, which triggers `write_context_fence` callbacks and
+    /// advances the seqno that Venus's cpu sync waits on.
+    #[cfg(target_os = "linux")]
+    fn work_loop_epoll(&mut self, virtio_gpu: &mut VirtioGpu) {
+        // Hold the global rutabaga poll descriptor for the loop lifetime.
+        let rutabaga_poll_desc = virtio_gpu.poll_descriptor();
+
+        // SAFETY: epoll_create1 is a straightforward syscall; we check the return value.
+        // The fd is intentionally never closed: this loop runs for the lifetime of the
+        // VM process, and the kernel reclaims it on exit.
+        let epoll_fd = unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) };
+        if epoll_fd < 0 {
+            panic!(
+                "gpu worker: epoll_create1 failed: {}",
+                std::io::Error::last_os_error()
+            );
+        }
+        // Store on self so CtxDestroy can deregister fds before destroying contexts.
+        self.epoll_fd = epoll_fd;
+
+        const TOKEN_CONTROL: u64 = 0;
+        const TOKEN_RUTABAGA: u64 = 1;
+        // Per-context tokens: TOKEN_CONTEXT_BASE + ctx_id.  ctx_id values start
+        // at 1, so TOKEN_CONTEXT_BASE = 16 leaves room for future global tokens.
+        const TOKEN_CONTEXT_BASE: u64 = 16;
+
+        // Register the virtio control eventfd.
+        let control_raw = self.control_evt.as_raw_fd();
+        let mut ev = libc::epoll_event {
+            events: libc::EPOLLIN as u32,
+            u64: TOKEN_CONTROL,
+        };
+        // SAFETY: control_raw is valid for the lifetime of self.control_evt.
+        let ret = unsafe { libc::epoll_ctl(epoll_fd, libc::EPOLL_CTL_ADD, control_raw, &mut ev) };
+        if ret != 0 {
+            panic!(
+                "gpu worker: epoll_ctl ADD control fd failed: {}",
+                std::io::Error::last_os_error()
+            );
+        }
+
+        // Register the virglrenderer global poll fd if present (non-render-server mode).
+        if let Some(ref desc) = rutabaga_poll_desc {
+            let rutabaga_raw = desc.as_raw_descriptor();
+            let mut ev = libc::epoll_event {
+                events: libc::EPOLLIN as u32,
+                u64: TOKEN_RUTABAGA,
+            };
+            // SAFETY: rutabaga_raw is a dup'd fd valid for the lifetime of rutabaga_poll_desc.
+            let ret = unsafe { libc::epoll_ctl(epoll_fd, libc::EPOLL_CTL_ADD, rutabaga_raw, &mut ev) };
+            if ret != 0 {
+                panic!(
+                    "gpu worker: epoll_ctl ADD rutabaga fd failed: {}",
+                    std::io::Error::last_os_error()
+                );
+            }
+        }
+
+        const MAX_EVENTS: usize = 8;
+        let mut events = [libc::epoll_event { events: 0, u64: 0 }; MAX_EVENTS];
+
+        loop {
+            // 1ms timeout: keeps blind-polled fallback contexts (those where
+            // virglrenderer returned -1 for the poll fd) drained each tick.
+            // SAFETY: epoll_wait with a valid epoll_fd, properly sized buffer.
+            let n = unsafe {
+                libc::epoll_wait(epoll_fd, events.as_mut_ptr(), MAX_EVENTS as i32, 1)
+            };
+            if n < 0 {
+                let err = std::io::Error::last_os_error();
+                if err.raw_os_error() == Some(libc::EINTR) {
+                    continue;
+                }
+                error!("gpu worker: epoll_wait failed: {err:?}");
+                continue;
+            }
+
+            let mut process_queue = false;
+            for event in events.iter().take(n as usize) {
+                // Copy the token out of the packed epoll_event field before
+                // matching: a guard like `t if t >= K` on a packed field would
+                // create a misaligned reference (E0793).
+                let token = event.u64;
+                match token {
+                    TOKEN_CONTROL => {
+                        if let Err(e) = self.control_evt.read() {
+                            error!("Failed to read control_evt: {e:?}");
+                        }
+                        process_queue = true;
+                    }
+                    TOKEN_RUTABAGA => {
+                        // Global poll fd fired (non-render-server mode): process events.
+                        virtio_gpu.event_poll();
+                    }
+                    t if t >= TOKEN_CONTEXT_BASE => {
+                        // Per-context poll fd fired: process this context's completions.
+                        let ctx_id = (t - TOKEN_CONTEXT_BASE) as u32;
+                        virtio_gpu.context_event_poll(ctx_id);
+                    }
+                    _ => {}
+                }
+            }
+
+            if process_queue {
+                if self.process_queue(virtio_gpu, &self.control_queue.clone())
+                    && let Err(e) = self.interrupt.try_signal_used_queue()
+                {
+                    error!("Error signaling queue: {e:?}");
+                }
+
+                // Register per-context poll fds for newly created contexts.
+                // Only contexts added since the last drain are registered.
+                // Deregistration on context destroy is handled eagerly in CtxDestroy
+                // before virglrenderer invalidates the fd.
+                for ctx_id in self.pending_ctx_registrations.drain(..) {
+                    if let Some(&Some(fd)) = self.context_poll_fds.get(&ctx_id) {
+                        let mut ev = libc::epoll_event {
+                            events: libc::EPOLLIN as u32,
+                            u64: TOKEN_CONTEXT_BASE + ctx_id as u64,
+                        };
+                        // SAFETY: fd is owned by virglrenderer and valid while the
+                        // context is alive.  CtxDestroy removes it before destroy.
+                        let ret = unsafe {
+                            libc::epoll_ctl(epoll_fd, libc::EPOLL_CTL_ADD, fd, &mut ev)
+                        };
+                        if ret != 0 {
+                            error!(
+                                "gpu worker: epoll_ctl ADD ctx {ctx_id} fd {fd}: {:?}",
+                                std::io::Error::last_os_error()
+                            );
+                        }
+                    }
+                }
+            }
+
+            // Blind-poll contexts whose virglrenderer poll fd was -1.
+            // Contexts with a valid poll fd are driven by epoll events above.
+            for (&ctx_id, &opt_fd) in &self.context_poll_fds {
+                if opt_fd.is_none() {
+                    virtio_gpu.context_event_poll(ctx_id);
+                }
+            }
+        }
+    }
+
+    /// Non-Linux GPU worker loop: blocks on the virtio control eventfd.
+    /// Used on macOS where virglrenderer render-server polling is not needed.
+    #[cfg(not(target_os = "linux"))]
+    fn work_loop_blocking(&mut self, virtio_gpu: &mut VirtioGpu) {
         loop {
             if let Err(e) = self.control_evt.read() {
                 error!("Failed to read control_evt: {e:?}");
@@ -204,9 +392,35 @@ impl Worker {
 
             GpuCommand::CtxCreate(info) => {
                 let context_name: Option<String> = String::from_utf8(info.debug_name.to_vec()).ok();
-                virtio_gpu.create_context(hdr.ctx_id, info.context_init, context_name.as_deref())
+                let result =
+                    virtio_gpu.create_context(hdr.ctx_id, info.context_init, context_name.as_deref());
+                #[cfg(target_os = "linux")]
+                if result.is_ok() {
+                    let poll_fd = virtio_gpu.context_poll_fd(hdr.ctx_id);
+                    self.context_poll_fds.insert(hdr.ctx_id, poll_fd);
+                    self.pending_ctx_registrations.push(hdr.ctx_id);
+                }
+                result
             }
-            GpuCommand::CtxDestroy(_info) => virtio_gpu.destroy_context(hdr.ctx_id),
+            GpuCommand::CtxDestroy(_info) => {
+                // Deregister from epoll BEFORE destroying the context.
+                // virglrenderer owns the poll fd and closes it on context destroy.
+                // Calling epoll_ctl(DEL) after destroy would use a stale or reused fd.
+                #[cfg(target_os = "linux")]
+                if let Some(Some(fd)) = self.context_poll_fds.remove(&hdr.ctx_id)
+                    && self.epoll_fd >= 0
+                {
+                    unsafe {
+                        libc::epoll_ctl(
+                            self.epoll_fd,
+                            libc::EPOLL_CTL_DEL,
+                            fd,
+                            std::ptr::null_mut(),
+                        )
+                    };
+                }
+                virtio_gpu.destroy_context(hdr.ctx_id)
+            }
             GpuCommand::CtxAttachResource(info) => {
                 virtio_gpu.context_attach_resource(hdr.ctx_id, info.resource_id)
             }

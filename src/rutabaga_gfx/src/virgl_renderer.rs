@@ -233,16 +233,21 @@ unsafe extern "C" fn get_server_fd(cookie: *mut c_void, version: u32) -> c_int {
         assert!(!cookie.is_null());
         let cookie = unsafe { &mut *(cookie as *mut RutabagaCookie) };
 
+        log::info!("get_server_fd called: version={version}, has_fd={}", cookie.render_server_fd.is_some());
+
         if version != 0 {
+            log::warn!("get_server_fd: unsupported version {version}, returning -1");
             return -1;
         }
 
         // Transfer the fd ownership to virglrenderer.
-        cookie
+        let fd = cookie
             .render_server_fd
             .take()
             .map(SafeDescriptor::into_raw_descriptor)
-            .unwrap_or(-1)
+            .unwrap_or(-1);
+        log::info!("get_server_fd: returning fd={fd}");
+        fd
     })
     .unwrap_or_else(|_| abort())
 }
@@ -340,7 +345,17 @@ impl VirglRenderer {
             INIT_ONCE.store(false, Ordering::Release);
         }
 
+        log::info!("virgl_renderer_init returned {ret}");
         ret_to_res(ret)?;
+
+        // Log Venus capset version to confirm Venus initialization.
+        {
+            let mut version: u32 = 0;
+            let mut size: u32 = 0;
+            unsafe { virgl_renderer_get_cap_set(4, &mut version, &mut size) };
+            log::info!("Venus capset (id=4): version={version} size={size}");
+        }
+
         Ok(Box::new(VirglRenderer {}))
     }
 
@@ -465,6 +480,28 @@ impl RutabagaComponent for VirglRenderer {
 
     fn event_poll(&self) {
         unsafe { virgl_renderer_poll() };
+    }
+
+    fn context_event_poll(&self, ctx_id: u32) {
+        // In render server mode, virgl_renderer_get_poll_fd() returns -1 (no global poll fd).
+        // Instead, each context has its own poll fd.  Calling virgl_renderer_context_poll()
+        // reads pending responses from the render server for this context and triggers
+        // write_context_fence callbacks, unblocking Venus's cpu sync.
+        unsafe { virgl_renderer_context_poll(ctx_id) };
+    }
+
+    fn context_poll_fd(&self, ctx_id: u32) -> Option<i32> {
+        // NOTE: virgl_renderer_context_get_poll_fd is marked "unstable / development
+        // only" in the virglrenderer header.  We use it because it is the only way
+        // to drive per-context fence delivery in render-server mode without busy-
+        // polling every context 1000x/sec.
+        //
+        // Ownership: the returned fd is owned by virglrenderer.  The caller MUST NOT
+        // close it.  It is invalidated when the context is destroyed via
+        // virgl_renderer_context_destroy, so callers must deregister it from any
+        // poll set before calling destroy.
+        let fd = unsafe { virgl_renderer_context_get_poll_fd(ctx_id) };
+        if fd >= 0 { Some(fd) } else { None }
     }
 
     fn poll_descriptor(&self) -> Option<SafeDescriptor> {
