@@ -113,6 +113,52 @@ pub fn run_workload(argv: &[String]) -> ! {
     }
 }
 
+/// Fast-path exec: copy the workload ELF from virtiofs into a memfd and
+/// `fexecve` from there.
+///
+/// On macOS hosts, Apple Hypervisor Framework charges ~5.5ms per guest page
+/// fault.  Mapping a multi-MB ELF straight from the virtiofs DAX window faults
+/// in every page (one HVF exit each), adding ~1.9s to agent startup.  Reading
+/// the binary once into a guest-RAM-backed memfd turns those into minor faults
+/// (no HVF exit), cutting agent load to ~50ms.
+///
+/// Returns only on failure; the caller then falls back to a plain `execvp`.
+#[cfg(target_os = "linux")]
+fn exec_via_memfd(c_argv: &[CString]) {
+    use nix::sys::memfd::{MFdFlags, memfd_create};
+    use std::os::unix::ffi::OsStrExt;
+
+    // Large sequential read — virtiofs FUSE handles this in a few round-trips
+    // (each trip = 2 HVF exits), far fewer than per-page DAX fault exits.
+    let path = std::ffi::OsStr::from_bytes(c_argv[0].as_bytes());
+    let bytes = match fs::read(path) {
+        Ok(b) => b,
+        Err(_) => return,
+    };
+
+    // memfd_create — pages land in guest RAM, not the DAX window.
+    let mem_fd = match memfd_create("agent", MFdFlags::MFD_CLOEXEC) {
+        Ok(fd) => fd,
+        Err(_) => return,
+    };
+
+    // Fill the memfd.
+    let mut off = 0;
+    while off < bytes.len() {
+        match unistd::write(&mem_fd, &bytes[off..]) {
+            Ok(0) | Err(_) => return,
+            Ok(n) => off += n,
+        }
+    }
+
+    // fexecve maps ELF segments from the memfd: faults hit guest RAM (minor
+    // faults, no HVF exits).  Only returns on failure.
+    let env: Vec<CString> = env::vars()
+        .filter_map(|(k, v)| CString::new(format!("{k}={v}")).ok())
+        .collect();
+    let _ = unistd::fexecve(&mem_fd, c_argv, &env);
+}
+
 fn exec_workload(argv: &[String]) -> ! {
     #[cfg(target_os = "linux")]
     setup_redirects();
@@ -123,6 +169,12 @@ fn exec_workload(argv: &[String]) -> ! {
         .iter()
         .map(|s| CString::new(s.as_str()).expect("argv contains null byte"))
         .collect();
+
+    // Fast path: exec the workload from a memfd to avoid per-page DAX faults
+    // (see `exec_via_memfd`).  Returns only on failure, then we fall back to
+    // the plain execvp below.
+    #[cfg(target_os = "linux")]
+    exec_via_memfd(&c_argv);
 
     let Err(e) = unistd::execvp(&c_argv[0], &c_argv);
     let code = if e == nix::errno::Errno::ENOENT {

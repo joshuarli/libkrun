@@ -226,6 +226,7 @@ impl FsWorker {
 
     fn process_queue(&mut self, queue_index: usize) {
         let queue = &mut self.queues[queue_index];
+        let mut signal_needed = false;
         while let Some(head) = queue.pop(&self.mem) {
             let reader = Reader::new(&self.mem, head.clone())
                 .map_err(FsError::QueueReader)
@@ -254,8 +255,14 @@ impl FsWorker {
             }
 
             if queue.needs_notification(&self.mem).unwrap() {
-                self.interrupt.signal_used_queue();
+                signal_needed = true;
             }
+        }
+        // Signal once after draining all descriptors rather than per-descriptor.
+        // Each signal_used_queue() triggers a vcpu_request_exit (~5ms HVF exit);
+        // batching turns N exits into 1 for a burst of FUSE requests.
+        if signal_needed {
+            self.interrupt.signal_used_queue();
         }
     }
 }
