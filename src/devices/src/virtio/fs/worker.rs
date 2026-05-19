@@ -258,9 +258,9 @@ impl FsWorker {
                 signal_needed = true;
             }
         }
-        // Signal once after draining all descriptors rather than per-descriptor.
-        // Each signal_used_queue() triggers a vcpu_request_exit (~5ms HVF exit);
-        // batching turns N exits into 1 for a burst of FUSE requests.
+        // Signal once after draining all descriptors rather than per-descriptor,
+        // avoiding redundant IRQ signals when multiple FUSE requests complete in
+        // a single epoll wake-up.
         if signal_needed {
             self.interrupt.signal_used_queue();
         }
