@@ -16,7 +16,7 @@ use utils::epoll::{ControlOperation, Epoll, EpollEvent, EventSet};
 use utils::eventfd::EventFd;
 use vm_memory::GuestMemoryMmap;
 
-use super::super::{FsError, Queue};
+use super::super::{FsError, FuseServerState, Queue};
 use super::augment_fs::AugmentFs;
 use super::defs::{HPQ_INDEX, REQ_INDEX};
 use super::descriptor_utils::{Reader, Writer};
@@ -98,12 +98,16 @@ impl FsWorker {
         virtual_entries: Vec<VirtualDirEntry>,
         stop_fd: EventFd,
         exit_code: Arc<AtomicI32>,
+        restore_fuse: Option<FuseServerState>,
         #[cfg(target_os = "macos")] map_sender: Option<Sender<WorkerMessage>>,
     ) -> Result<Self, io::Error> {
         let inode_alloc = Arc::new(InodeAllocator::new());
         let server = match passthrough_cfg {
             Some(cfg) if read_only => {
                 let inner = PassthroughFsRo::new(cfg, inode_alloc.clone())?;
+                if let Some(state) = restore_fuse.as_ref() {
+                    inner.inner().restore(state)?;
+                }
                 FsServer::ReadOnly(Server::new(AugmentFs::new(
                     inner,
                     &inode_alloc,
@@ -112,6 +116,9 @@ impl FsWorker {
             }
             Some(cfg) => {
                 let inner = PassthroughFs::new(cfg, inode_alloc.clone())?;
+                if let Some(state) = restore_fuse.as_ref() {
+                    inner.restore(state)?;
+                }
                 FsServer::ReadWrite(Server::new(AugmentFs::new(
                     inner,
                     &inode_alloc,
@@ -138,14 +145,30 @@ impl FsWorker {
         })
     }
 
-    pub fn run(self) -> thread::JoinHandle<()> {
+    pub fn run(self) -> thread::JoinHandle<FsWorker> {
         thread::Builder::new()
             .name("fs worker".into())
             .spawn(|| self.work())
             .unwrap()
     }
 
-    fn work(mut self) {
+    /// Snapshot the worker's virtqueue indices (for checkpoint/fork). Call only
+    /// while the worker is stopped (reclaimed), so there is no concurrent access.
+    pub(crate) fn save_queue_states(&self) -> Vec<crate::virtio::queue::QueueState> {
+        self.queues.iter().map(|q| q.save_state()).collect()
+    }
+
+    /// Snapshot the FUSE passthrough server's logical state (inode/handle maps as
+    /// host paths) for checkpoint/fork. Call only while the worker is stopped.
+    pub(crate) fn save_fuse_state(&self) -> Option<FuseServerState> {
+        match &self.server {
+            FsServer::ReadWrite(s) => Some(s.fs().inner().snapshot()),
+            FsServer::ReadOnly(s) => Some(s.fs().inner().inner().snapshot()),
+            FsServer::Null(_) => None,
+        }
+    }
+
+    fn work(mut self) -> FsWorker {
         let virtq_hpq_ev_fd = self.queue_evts[HPQ_INDEX].as_raw_fd();
         let virtq_req_ev_fd = self.queue_evts[REQ_INDEX].as_raw_fd();
         let stop_ev_fd = self.stop_fd.as_raw_fd();
@@ -185,7 +208,7 @@ impl FsWorker {
                             EventSet::IN if source == stop_ev_fd => {
                                 debug!("stopping worker thread");
                                 let _ = self.stop_fd.read();
-                                return;
+                                return self;
                             }
                             _ => {
                                 log::warn!(

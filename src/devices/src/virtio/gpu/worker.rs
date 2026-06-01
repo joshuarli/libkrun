@@ -188,7 +188,8 @@ impl Worker {
                 u64: TOKEN_RUTABAGA,
             };
             // SAFETY: rutabaga_raw is a dup'd fd valid for the lifetime of rutabaga_poll_desc.
-            let ret = unsafe { libc::epoll_ctl(epoll_fd, libc::EPOLL_CTL_ADD, rutabaga_raw, &mut ev) };
+            let ret =
+                unsafe { libc::epoll_ctl(epoll_fd, libc::EPOLL_CTL_ADD, rutabaga_raw, &mut ev) };
             if ret != 0 {
                 panic!(
                     "gpu worker: epoll_ctl ADD rutabaga fd failed: {}",
@@ -204,9 +205,8 @@ impl Worker {
             // 1ms timeout: keeps blind-polled fallback contexts (those where
             // virglrenderer returned -1 for the poll fd) drained each tick.
             // SAFETY: epoll_wait with a valid epoll_fd, properly sized buffer.
-            let n = unsafe {
-                libc::epoll_wait(epoll_fd, events.as_mut_ptr(), MAX_EVENTS as i32, 1)
-            };
+            let n =
+                unsafe { libc::epoll_wait(epoll_fd, events.as_mut_ptr(), MAX_EVENTS as i32, 1) };
             if n < 0 {
                 let err = std::io::Error::last_os_error();
                 if err.raw_os_error() == Some(libc::EINTR) {
@@ -261,9 +261,8 @@ impl Worker {
                         };
                         // SAFETY: fd is owned by virglrenderer and valid while the
                         // context is alive.  CtxDestroy removes it before destroy.
-                        let ret = unsafe {
-                            libc::epoll_ctl(epoll_fd, libc::EPOLL_CTL_ADD, fd, &mut ev)
-                        };
+                        let ret =
+                            unsafe { libc::epoll_ctl(epoll_fd, libc::EPOLL_CTL_ADD, fd, &mut ev) };
                         if ret != 0 {
                             error!(
                                 "gpu worker: epoll_ctl ADD ctx {ctx_id} fd {fd}: {:?}",
@@ -392,8 +391,11 @@ impl Worker {
 
             GpuCommand::CtxCreate(info) => {
                 let context_name: Option<String> = String::from_utf8(info.debug_name.to_vec()).ok();
-                let result =
-                    virtio_gpu.create_context(hdr.ctx_id, info.context_init, context_name.as_deref());
+                let result = virtio_gpu.create_context(
+                    hdr.ctx_id,
+                    info.context_init,
+                    context_name.as_deref(),
+                );
                 #[cfg(target_os = "linux")]
                 if result.is_ok() {
                     let poll_fd = virtio_gpu.context_poll_fd(hdr.ctx_id);

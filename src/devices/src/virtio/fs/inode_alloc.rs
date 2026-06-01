@@ -25,4 +25,15 @@ impl InodeAllocator {
     pub fn next(&self) -> u64 {
         self.next.fetch_add(1, Ordering::Relaxed)
     }
+
+    /// Current value of the allocation counter (for checkpoint/snapshot).
+    pub fn current(&self) -> u64 {
+        self.next.load(Ordering::Relaxed)
+    }
+
+    /// Restore the allocation counter from a snapshot. Call before reopening
+    /// handles so newly-allocated ids don't collide with restored ones.
+    pub fn restore(&self, value: u64) {
+        self.next.store(value, Ordering::Relaxed);
+    }
 }

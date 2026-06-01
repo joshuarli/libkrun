@@ -64,6 +64,12 @@ impl PassthroughFsRo {
             inner: PassthroughFs::new(cfg, inode_alloc)?,
         })
     }
+
+    /// Access the wrapped read-write passthrough (for snapshot/restore of the
+    /// FUSE inode/handle maps, which are identical regardless of read-only mode).
+    pub fn inner(&self) -> &PassthroughFs {
+        &self.inner
+    }
 }
 
 impl FileSystem for PassthroughFsRo {

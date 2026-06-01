@@ -117,6 +117,47 @@ impl Vm {
         Ok(())
     }
 
+    /// Capture VM-level state for a checkpoint. HVF has no in-kernel interrupt
+    /// controller / PIT / clock to serialize (unlike KVM's PIC/IOAPIC/PIT/clock)
+    /// — guest-timer continuity is handled by the vtimer-offset adjustment on
+    /// resume — so the macOS `VmState` is empty. Present for cross-platform
+    /// symmetry with the KVM `Vm::save_state`.
+    #[cfg(target_arch = "aarch64")]
+    pub fn save_state(&self) -> Result<VmState> {
+        // Capture the in-kernel HVF GIC distributor state (SPI group/priority/
+        // config/routing + set-enables). A restored clone is a fresh hv_vm_create
+        // whose vGIC is in reset state, so without this its device IRQs (e.g.
+        // vsock) are masked and never wake the guest from WFI. Best-effort: if
+        // there is no in-kernel GIC (emulated fallback), leave it empty — the
+        // in-place pause/resume checkpoint path does not need it.
+        let gic_distributor = match hvf::gic_save_distributor() {
+            Ok(regs) => {
+                debug!("captured {} GIC distributor registers", regs.len());
+                regs
+            }
+            Err(e) => {
+                // Not fatal for in-place pause/resume (no in-kernel GIC to
+                // transfer), but a fork clone will not receive device IRQs
+                // without it — surface it rather than failing silently.
+                warn!("GIC distributor capture failed ({e:?}); a fork clone may not wake on device IRQs");
+                Vec::new()
+            }
+        };
+        Ok(VmState { gic_distributor })
+    }
+
+    /// Restore VM-level state: replay the GIC distributor registers onto the
+    /// clone's fresh vGIC (GICD_CTLR enabled last). No-op if empty.
+    #[cfg(target_arch = "aarch64")]
+    pub fn restore_state(&self, state: &VmState) -> Result<()> {
+        if !state.gic_distributor.is_empty() {
+            if let Err(e) = hvf::gic_restore_distributor(&state.gic_distributor) {
+                error!("failed to restore GIC distributor state: {e:?}");
+            }
+        }
+        Ok(())
+    }
+
     /// Initializes the guest memory.
     pub fn memory_init(&mut self, guest_mem: &GuestMemoryMmap) -> Result<()> {
         for region in guest_mem.iter() {
@@ -210,6 +251,12 @@ pub struct Vcpu {
 
     vcpu_list: Arc<VcpuList>,
     nested_enabled: bool,
+    /// When set, the vCPU thread does NOT run guest code after thread setup; it
+    /// sits in the paused event loop until a `Resume` arrives. Used by the
+    /// restore-into-a-fresh-clone path so the orchestrator can load the saved
+    /// register state before the guest executes (the KVM analogue is starting
+    /// the vCPU in its paused state machine).
+    start_paused: bool,
 }
 
 impl Vcpu {
@@ -303,7 +350,14 @@ impl Vcpu {
             response_sender,
             vcpu_list,
             nested_enabled,
+            start_paused: false,
         })
+    }
+
+    /// Mark this vCPU to start paused (see [`Vcpu::start_paused`]). Call before
+    /// [`Vcpu::start_threaded`] on the restore-into-a-clone path.
+    pub fn set_start_paused(&mut self, v: bool) {
+        self.start_paused = v;
     }
 
     /// Returns the cpu index as seen by the guest OS.
@@ -460,15 +514,29 @@ impl Vcpu {
             .send(hvf_vcpuid)
             .expect("Cannot notify vcpu TLS initialization.");
 
-        let entry_addr = if let Some(boot_receiver) = &self.boot_receiver {
-            boot_receiver.recv().unwrap()
-        } else {
-            self.boot_entry_addr
+        // Restore-into-a-clone: the secondary-vCPU PSCI `CpuOn` handshake already
+        // happened in the golden, and each vCPU's PC comes from the restored
+        // register state — so do NOT block on `boot_receiver` (no `CpuOn` will be
+        // sent here, and the orchestrator drives restore over the event channel).
+        // set_initial_state's entry_addr is overwritten by the restore anyway.
+        let entry_addr = match &self.boot_receiver {
+            Some(boot_receiver) if !self.start_paused => boot_receiver.recv().unwrap(),
+            _ => self.boot_entry_addr,
         };
 
         hvf_vcpu
             .set_initial_state(entry_addr, self.fdt_addr)
             .unwrap_or_else(|_| panic!("Can't set HVF vCPU {hvf_vcpuid} initial state"));
+
+        // Restore-into-a-clone: hold here in the paused event loop (handling the
+        // orchestrator's RestoreState) until a Resume arrives, so the saved
+        // register state is loaded BEFORE the guest executes. set_initial_state
+        // above still ran to program the VMM-managed EL2/HCR state (which is not
+        // part of the snapshot); the restore overwrites PC/CPSR/EL1/GP/SIMD.
+        if self.start_paused && !self.run_paused_loop(hvf_vcpuid) {
+            self.exit(FC_EXIT_CODE_GENERIC_ERROR);
+            return;
+        }
 
         loop {
             if !self.handle_pending_event(false, hvf_vcpuid) {
@@ -529,6 +597,56 @@ impl Vcpu {
         }
     }
 
+    /// Block in the paused event loop: handle Pause/SaveState/RestoreState and
+    /// return `true` on Resume (caller proceeds to run the guest) or `false` on
+    /// error / channel close (caller exits). Shared by the `Pause` event handler
+    /// and the restore-into-a-clone paused start (see [`Vcpu::start_paused`]).
+    fn run_paused_loop(&mut self, hvf_vcpuid: u64) -> bool {
+        loop {
+            match self.event_receiver.recv() {
+                Ok(VcpuEvent::Resume { paused_ns }) => {
+                    if hvf::vcpu_adjust_vtimer_offset(hvf_vcpuid, paused_ns).is_err() {
+                        return false;
+                    }
+                    self.response_sender
+                        .send(VcpuResponse::Resumed)
+                        .expect("failed to send resume status");
+                    return true;
+                }
+                Ok(VcpuEvent::Pause) => {
+                    self.response_sender
+                        .send(VcpuResponse::Paused)
+                        .expect("failed to send pause status");
+                }
+                // Checkpoint: capture register state while paused (the safe
+                // boundary). Stays paused afterwards.
+                #[cfg(target_arch = "aarch64")]
+                Ok(VcpuEvent::SaveState) => match hvf::vcpu_save_state(hvf_vcpuid) {
+                    Ok(state) => self
+                        .response_sender
+                        .send(VcpuResponse::SavedState(Box::new(state)))
+                        .expect("failed to send saved vcpu state"),
+                    Err(e) => {
+                        error!("failed to capture HVF vcpu state: {e:?}");
+                        return false;
+                    }
+                },
+                // Restore: load captured register state onto the paused vCPU.
+                #[cfg(target_arch = "aarch64")]
+                Ok(VcpuEvent::RestoreState(state)) => {
+                    if let Err(e) = hvf::vcpu_restore_state(hvf_vcpuid, &state) {
+                        error!("failed to restore HVF vcpu state: {e:?}");
+                        return false;
+                    }
+                    self.response_sender
+                        .send(VcpuResponse::RestoredState)
+                        .expect("failed to send restored vcpu ack");
+                }
+                Err(_) => return false,
+            }
+        }
+    }
+
     fn handle_pending_event(&mut self, block: bool, hvf_vcpuid: u64) -> bool {
         let event = if block {
             match self.event_receiver.recv() {
@@ -548,25 +666,7 @@ impl Vcpu {
                 self.response_sender
                     .send(VcpuResponse::Paused)
                     .expect("failed to send pause status");
-                loop {
-                    match self.event_receiver.recv() {
-                        Ok(VcpuEvent::Resume { paused_ns }) => {
-                            if hvf::vcpu_adjust_vtimer_offset(hvf_vcpuid, paused_ns).is_err() {
-                                return false;
-                            }
-                            self.response_sender
-                                .send(VcpuResponse::Resumed)
-                                .expect("failed to send resume status");
-                            return true;
-                        }
-                        Ok(VcpuEvent::Pause) => {
-                            self.response_sender
-                                .send(VcpuResponse::Paused)
-                                .expect("failed to send pause status");
-                        }
-                        Err(_) => return false,
-                    }
-                }
+                self.run_paused_loop(hvf_vcpuid)
             }
             Some(VcpuEvent::Resume { paused_ns }) => {
                 if hvf::vcpu_adjust_vtimer_offset(hvf_vcpuid, paused_ns).is_err() {
@@ -575,6 +675,13 @@ impl Vcpu {
                 self.response_sender
                     .send(VcpuResponse::Resumed)
                     .expect("failed to send resume status");
+                true
+            }
+            // Save/restore are only valid while paused; the orchestrator always
+            // pauses first, so receiving one here is a protocol error — ignore it.
+            #[cfg(target_arch = "aarch64")]
+            Some(VcpuEvent::SaveState) | Some(VcpuEvent::RestoreState(_)) => {
+                error!("ignoring vcpu SaveState/RestoreState received while running");
                 true
             }
             None => true,
@@ -598,6 +705,63 @@ impl Drop for Vcpu {
     }
 }
 
+/// Captured HVF vCPU register state (the macOS analogue of KVM's `VcpuState`),
+/// used by the cross-platform checkpoint/restore orchestration in `vmm::lib`.
+#[cfg(target_arch = "aarch64")]
+pub type VcpuState = hvf::HvfVcpuState;
+
+/// VM-level state for a checkpoint. Empty on HVF (no in-kernel PIC/PIT/clock to
+/// serialize); see [`Vm::save_state`].
+#[cfg(target_arch = "aarch64")]
+#[derive(Clone, Debug, Default)]
+pub struct VmState {
+    /// In-kernel HVF GIC distributor registers as (reg-offset, value) pairs
+    /// (see [`Vm::save_state`]). Empty when there is no in-kernel GIC.
+    pub gic_distributor: Vec<(u32, u64)>,
+}
+
+#[cfg(target_arch = "aarch64")]
+impl VmState {
+    /// Serialize the VM-level state (the HVF GIC distributor registers) to a
+    /// byte blob (mirrors the KVM `VmState::serialize` signature so the
+    /// cross-platform [`crate::VmCheckpoint`] can call it uniformly).
+    pub fn serialize(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(4 + self.gic_distributor.len() * 12);
+        out.extend_from_slice(&(self.gic_distributor.len() as u32).to_le_bytes());
+        for &(reg, val) in &self.gic_distributor {
+            out.extend_from_slice(&reg.to_le_bytes());
+            out.extend_from_slice(&val.to_le_bytes());
+        }
+        out
+    }
+
+    /// Reconstruct from a blob produced by [`Self::serialize`].
+    pub fn deserialize(bytes: &[u8]) -> std::result::Result<VmState, String> {
+        if bytes.is_empty() {
+            return Ok(VmState::default());
+        }
+        let err = || "macOS VmState blob truncated".to_string();
+        let mut pos = 0usize;
+        let take = |b: &[u8], pos: &mut usize, n: usize| -> std::result::Result<Vec<u8>, String> {
+            if *pos + n > b.len() {
+                return Err("macOS VmState blob truncated".to_string());
+            }
+            let s = b[*pos..*pos + n].to_vec();
+            *pos += n;
+            Ok(s)
+        };
+        let n =
+            u32::from_le_bytes(take(bytes, &mut pos, 4)?.try_into().map_err(|_| err())?) as usize;
+        let mut gic_distributor = Vec::with_capacity(n);
+        for _ in 0..n {
+            let reg = u32::from_le_bytes(take(bytes, &mut pos, 4)?.try_into().map_err(|_| err())?);
+            let val = u64::from_le_bytes(take(bytes, &mut pos, 8)?.try_into().map_err(|_| err())?);
+            gic_distributor.push((reg, val));
+        }
+        Ok(VmState { gic_distributor })
+    }
+}
+
 #[derive(Debug)]
 /// List of events that the Vcpu can receive.
 pub enum VcpuEvent {
@@ -605,9 +769,15 @@ pub enum VcpuEvent {
     Pause,
     /// Event that should resume the Vcpu.
     Resume { paused_ns: u64 },
+    /// Capture the full vCPU register state (the vCPU must be paused).
+    #[cfg(target_arch = "aarch64")]
+    SaveState,
+    /// Restore previously-captured vCPU register state (vCPU paused).
+    #[cfg(target_arch = "aarch64")]
+    RestoreState(Box<VcpuState>),
 }
 
-#[derive(Debug, Eq, PartialEq)]
+#[derive(Debug)]
 /// List of responses that the Vcpu reports.
 pub enum VcpuResponse {
     /// Vcpu is paused.
@@ -616,6 +786,12 @@ pub enum VcpuResponse {
     Resumed,
     /// Vcpu is stopped.
     Exited(u8),
+    /// Captured vCPU register state, in reply to [`VcpuEvent::SaveState`].
+    #[cfg(target_arch = "aarch64")]
+    SavedState(Box<VcpuState>),
+    /// Acknowledges a [`VcpuEvent::RestoreState`].
+    #[cfg(target_arch = "aarch64")]
+    RestoredState,
 }
 
 /// Wrapper over Vcpu that hides the underlying interactions with the Vcpu thread.
@@ -624,6 +800,9 @@ pub struct VcpuHandle {
     response_receiver: Receiver<VcpuResponse>,
     hvf_vcpuid: u64,
     vcpu_list: Arc<VcpuList>,
+    // Held to own the vCPU thread's JoinHandle for the lifetime of the handle
+    // (so the thread isn't detached); not read back.
+    #[allow(dead_code)]
     vcpu_thread: Option<thread::JoinHandle<()>>,
 }
 

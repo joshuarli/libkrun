@@ -83,6 +83,12 @@ impl<T: FileSystem<Inode = Inode, Handle = Handle>> AugmentFs<T> {
         }
     }
 
+    /// Borrow the wrapped filesystem (e.g. for checkpoint/snapshot, which
+    /// operates on the underlying passthrough fs, not the augment layer).
+    pub fn inner(&self) -> &T {
+        &self.inner
+    }
+
     fn register_entries(
         parent: Inode,
         entries: Vec<VirtualDirEntry>,
