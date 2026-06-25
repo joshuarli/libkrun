@@ -16,7 +16,7 @@ use crate::virtio::{
 };
 
 use std::thread::JoinHandle;
-use utils::eventfd::{EventFd, EFD_NONBLOCK};
+use utils::eventfd::{EFD_NONBLOCK, EventFd};
 
 use super::backend::{ReadError, WriteError};
 use super::worker::NetWorker;

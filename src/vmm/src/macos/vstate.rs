@@ -139,7 +139,9 @@ impl Vm {
                 // Not fatal for in-place pause/resume (no in-kernel GIC to
                 // transfer), but a fork clone will not receive device IRQs
                 // without it — surface it rather than failing silently.
-                warn!("GIC distributor capture failed ({e:?}); a fork clone may not wake on device IRQs");
+                warn!(
+                    "GIC distributor capture failed ({e:?}); a fork clone may not wake on device IRQs"
+                );
                 Vec::new()
             }
         };

@@ -9,7 +9,7 @@ use super::TsiFlags;
 use super::VsockError;
 use super::defs;
 use super::defs::uapi;
-use super::dns_filter::{sockaddr_port, DnsRequest, DnsWorker, EgressPolicy};
+use super::dns_filter::{DnsRequest, DnsWorker, EgressPolicy, sockaddr_port};
 use super::muxer_rxq::{MuxerRxQ, rx_to_pkt};
 use super::muxer_thread::MuxerThread;
 use super::packet::{TsiConnectReq, TsiGetnameRsp, VsockPacket};

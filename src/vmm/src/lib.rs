@@ -323,7 +323,7 @@ impl Vmm {
                 Ok(response)
                     if std::mem::discriminant(&response) == std::mem::discriminant(&expected) =>
                 {
-                    return Ok(())
+                    return Ok(());
                 }
                 Ok(VcpuResponse::Exited(_)) => return Err(Error::VcpuPause),
                 Ok(_) => {}
@@ -568,13 +568,13 @@ impl Vmm {
                 Ok(VcpuResponse::Exited(_)) => {
                     return Err(Error::VcpuSnapshot(
                         "vCPU exited during capture".to_string(),
-                    ))
+                    ));
                 }
                 Ok(_) => {}
                 Err(_) => {
                     return Err(Error::VcpuSnapshot(
                         "channel closed while capturing vCPU state".to_string(),
-                    ))
+                    ));
                 }
             }
         }

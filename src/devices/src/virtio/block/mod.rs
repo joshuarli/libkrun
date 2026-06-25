@@ -4,7 +4,7 @@
 pub mod device;
 mod worker;
 
-pub use self::device::{create_overlay, Block, BlockState, CacheType};
+pub use self::device::{Block, BlockState, CacheType, create_overlay};
 
 use vm_memory::GuestMemoryError;
 

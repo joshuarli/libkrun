@@ -93,7 +93,9 @@ impl Vsock {
     }
 
     fn handle_activate_event(&self, event_manager: &mut EventManager) {
-        info!("[VSOCK_TIMING] handle_activate_event called - registering RX/TX queues with event manager");
+        info!(
+            "[VSOCK_TIMING] handle_activate_event called - registering RX/TX queues with event manager"
+        );
         debug!("activate event");
         if let Err(e) = self.activate_evt.read() {
             error!("Failed to consume vsock activate event: {e:?}");

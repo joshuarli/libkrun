@@ -18,7 +18,7 @@ use super::super::Queue as VirtQueue;
 use super::super::linux_errno::linux_errno_raw;
 use super::defs;
 use super::defs::uapi;
-use super::dns_filter::{sockaddr_port, DnsRequest, DNS_PORT};
+use super::dns_filter::{DNS_PORT, DnsRequest, sockaddr_port};
 use super::muxer::{MuxerRx, push_packet};
 use super::muxer_rxq::MuxerRxQ;
 use super::packet::{

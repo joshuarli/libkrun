@@ -38,8 +38,8 @@ use std::os::windows::io::BorrowedHandle;
 use std::path::PathBuf;
 use std::slice;
 use std::sync::LazyLock;
-use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicI32, Ordering};
+use std::sync::{Arc, Mutex};
 use utils::eventfd::EventFd;
 #[cfg(target_os = "windows")]
 use utils::windows::AsRawFd;

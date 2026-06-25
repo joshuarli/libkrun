@@ -770,8 +770,12 @@ impl Proxy for UnixAcceptorProxy {
 
             match accept(self.fd.as_raw_fd()) {
                 Ok(accept_fd) => {
-                    info!("[VSOCK_TIMING] UnixAcceptorProxy id={:#x} accepted connection fd={} in {:?}",
-                          self.id, accept_fd, accept_start.elapsed());
+                    info!(
+                        "[VSOCK_TIMING] UnixAcceptorProxy id={:#x} accepted connection fd={} in {:?}",
+                        self.id,
+                        accept_fd,
+                        accept_start.elapsed()
+                    );
                     // Safe because we've just obtained the FD from the `accept` call above.
                     let new_fd = unsafe { OwnedFd::from_raw_fd(accept_fd) };
                     update.new_proxy = Some((

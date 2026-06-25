@@ -11,7 +11,7 @@ use std::{fmt, io};
 
 use devices::fdt::DeviceInfoForFDT;
 use devices::legacy::IrqChip;
-use devices::virtio::persist::{restore_device, snapshot_device, VmDevicesState};
+use devices::virtio::persist::{VmDevicesState, restore_device, snapshot_device};
 use devices::{BusDevice, DeviceType};
 use kernel::cmdline as kernel_cmdline;
 use polly::event_manager::EventManager;

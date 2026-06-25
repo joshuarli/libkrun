@@ -13,7 +13,7 @@ use std::{fmt, io};
 use devices::fdt::DeviceInfoForFDT;
 #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
 use devices::legacy::IrqChip;
-use devices::virtio::persist::{restore_device, snapshot_device, VmDevicesState};
+use devices::virtio::persist::{VmDevicesState, restore_device, snapshot_device};
 use devices::{BusDevice, DeviceType};
 use kernel::cmdline as kernel_cmdline;
 use kvm_ioctls::{IoEventAddress, VmFd};

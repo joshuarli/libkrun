@@ -109,8 +109,10 @@ impl MuxerThread {
         if let Some((peer_port, accept_fd, family, proxy_type)) = update.new_proxy {
             let local_port: u32 = thread_rng.random_range(1024..u32::MAX);
             let new_id: u64 = ((peer_port as u64) << 32) | (local_port as u64);
-            info!("[VSOCK_TIMING] creating new proxy: new_id={:#x} (peer_port={}, local_port={}) from acceptor id={:#x}",
-                  new_id, peer_port, local_port, id);
+            info!(
+                "[VSOCK_TIMING] creating new proxy: new_id={:#x} (peer_port={}, local_port={}) from acceptor id={:#x}",
+                new_id, peer_port, local_port, id
+            );
             let new_proxy: Box<dyn Proxy> = match proxy_type {
                 NewProxyType::Tcp => Box::new(TsiStreamProxy::new_reverse(
                     new_id,
@@ -223,8 +225,10 @@ impl MuxerThread {
             {
                 Ok(ev_cnt) => {
                     if first_event && ev_cnt > 0 {
-                        info!("[VSOCK_TIMING] MuxerThread received first epoll event(s) after {:?} since work() start",
-                              work_start.elapsed());
+                        info!(
+                            "[VSOCK_TIMING] MuxerThread received first epoll event(s) after {:?} since work() start",
+                            work_start.elapsed()
+                        );
                         first_event = false;
                     }
                     event_count += ev_cnt as u64;

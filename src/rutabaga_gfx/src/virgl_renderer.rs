@@ -504,11 +504,7 @@ impl RutabagaComponent for VirglRenderer {
         // virgl_renderer_context_destroy, so callers must deregister it from any
         // poll set before calling destroy.
         let fd = unsafe { virgl_renderer_context_get_poll_fd(ctx_id) };
-        if fd >= 0 {
-            Some(fd)
-        } else {
-            None
-        }
+        if fd >= 0 { Some(fd) } else { None }
     }
 
     fn poll_descriptor(&self) -> Option<SafeDescriptor> {

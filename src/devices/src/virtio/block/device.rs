@@ -19,9 +19,9 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
 use imago::{
-    file::File as ImagoFile, qcow2::Qcow2, raw::Raw, vmdk::Vmdk, DynStorage, FormatCreateBuilder,
-    FormatDriverBuilder, PermissiveImplicitOpenGate, Storage, StorageCreateOptions,
-    StorageOpenOptions, SyncFormatAccess,
+    DynStorage, FormatCreateBuilder, FormatDriverBuilder, PermissiveImplicitOpenGate, Storage,
+    StorageCreateOptions, StorageOpenOptions, SyncFormatAccess, file::File as ImagoFile,
+    qcow2::Qcow2, raw::Raw, vmdk::Vmdk,
 };
 use log::{error, warn};
 use utils::eventfd::{EFD_NONBLOCK, EventFd};
@@ -46,9 +46,9 @@ use super::{
 };
 
 use crate::virtio::{
+    ActivateError, InterruptTransport,
     block::{ImageType, SyncMode},
     queue::QueueState,
-    ActivateError, InterruptTransport,
 };
 
 /// Configuration options for disk caching.
