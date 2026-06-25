@@ -152,10 +152,10 @@ impl Vm {
     /// clone's fresh vGIC (GICD_CTLR enabled last). No-op if empty.
     #[cfg(target_arch = "aarch64")]
     pub fn restore_state(&self, state: &VmState) -> Result<()> {
-        if !state.gic_distributor.is_empty() {
-            if let Err(e) = hvf::gic_restore_distributor(&state.gic_distributor) {
-                error!("failed to restore GIC distributor state: {e:?}");
-            }
+        if !state.gic_distributor.is_empty()
+            && let Err(e) = hvf::gic_restore_distributor(&state.gic_distributor)
+        {
+            error!("failed to restore GIC distributor state: {e:?}");
         }
         Ok(())
     }

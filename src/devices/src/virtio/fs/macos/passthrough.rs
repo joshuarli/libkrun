@@ -12,7 +12,7 @@ use std::mem::MaybeUninit;
 use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
 use std::ptr::null_mut;
 use std::str::FromStr;
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
@@ -547,6 +547,10 @@ pub struct Config {
     pub export_fsid: u64,
     /// Table of exported FDs to share with other subsystems. Not supported for macos.
     pub export_table: Option<ExportTable>,
+
+    /// Whether the guest may request deletion of the root directory via the
+    /// `VIRTIO_IOC_REMOVE_ROOT_DIR_REQ` ioctl. Defaults to `false`.
+    pub allow_root_dir_delete: bool,
 }
 
 impl Default for Config {
@@ -561,6 +565,7 @@ impl Default for Config {
             proc_sfd_rawfd: None,
             export_fsid: 0,
             export_table: None,
+            allow_root_dir_delete: false,
         }
     }
 }
@@ -672,7 +677,7 @@ impl PassthroughFs {
         {
             let inodes = self.inodes.read().unwrap();
             for (nodeid, data) in inodes.iter() {
-                if *nodeid == fuse::ROOT_ID || *nodeid == self.init_inode {
+                if *nodeid == fuse::ROOT_ID {
                     continue;
                 }
                 inode_snaps.push(FuseInodeSnap {
@@ -701,7 +706,7 @@ impl PassthroughFs {
         FuseServerState {
             inodes: inode_snaps,
             handles: handle_snaps,
-            next_inode: self.next_inode.load(Ordering::Relaxed),
+            next_inode: self.inode_alloc.current(),
             next_handle: self.next_handle.load(Ordering::Relaxed),
             writeback: self.writeback.load(Ordering::Relaxed),
             announce_submounts: self.announce_submounts.load(Ordering::Relaxed),
@@ -747,7 +752,7 @@ impl PassthroughFs {
 
         // Counters must be restored before reopening handles so newly-allocated
         // ids don't collide with the restored ones.
-        self.next_inode.store(state.next_inode, Ordering::Relaxed);
+        self.inode_alloc.restore(state.next_inode);
         self.next_handle.store(state.next_handle, Ordering::Relaxed);
         self.writeback.store(state.writeback, Ordering::Relaxed);
         self.announce_submounts
