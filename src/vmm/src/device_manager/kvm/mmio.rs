@@ -13,7 +13,7 @@ use std::{fmt, io};
 use devices::fdt::DeviceInfoForFDT;
 #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
 use devices::legacy::IrqChip;
-use devices::virtio::persist::{restore_device, snapshot_device, VmDevicesState};
+use devices::virtio::persist::{VmDevicesState, restore_device, snapshot_device};
 use devices::{BusDevice, DeviceType};
 use kernel::cmdline as kernel_cmdline;
 use kvm_ioctls::{IoEventAddress, VmFd};
@@ -42,6 +42,9 @@ pub enum Error {
     DeviceNotFound,
     /// Failed to update the mmio device.
     UpdateFailed,
+    /// Failed to create vhost-user device.
+    #[cfg(all(feature = "vhost-user", target_os = "linux"))]
+    VhostUserDevice(io::Error),
 }
 
 impl fmt::Display for Error {
@@ -60,6 +63,8 @@ impl fmt::Display for Error {
             Error::RegisterIrqFd(ref e) => write!(f, "failed to register irqfd: {e}"),
             Error::DeviceNotFound => write!(f, "the device couldn't be found"),
             Error::UpdateFailed => write!(f, "failed to update the mmio device"),
+            #[cfg(all(feature = "vhost-user", target_os = "linux"))]
+            Error::VhostUserDevice(ref e) => write!(f, "failed to create vhost-user device: {e}"),
         }
     }
 }
@@ -299,10 +304,9 @@ impl MMIODeviceManager {
         if let Some(dev_info) = self
             .id_to_dev_info
             .get(&(device_type, device_id.to_string()))
+            && let Some((_, device)) = self.bus.get_device(dev_info.addr)
         {
-            if let Some((_, device)) = self.bus.get_device(dev_info.addr) {
-                return Some(device);
-            }
+            return Some(device);
         }
         None
     }
@@ -506,7 +510,7 @@ mod tests {
         }
 
         fn queue_config(&self) -> &[QueueConfig] {
-            &QUEUE_CONFIG
+            QUEUE_CONFIG
         }
 
         fn read_config(&self, offset: u64, data: &mut [u8]) {
@@ -550,9 +554,11 @@ mod tests {
         let mut cmdline = kernel_cmdline::Cmdline::new(4096);
         let dummy = Arc::new(Mutex::new(DummyDevice::new()));
 
-        assert!(device_manager
-            .register_virtio_device(vm.fd(), guest_mem, dummy, &mut cmdline, 0, "dummy")
-            .is_ok());
+        assert!(
+            device_manager
+                .register_virtio_device(vm.fd(), guest_mem, dummy, &mut cmdline, 0, "dummy")
+                .is_ok()
+        );
     }
 
     #[test]
@@ -680,9 +686,11 @@ mod tests {
             type_id,
             &id,
         ) {
-            assert!(device_manager
-                .get_device(DeviceType::Virtio(type_id), &id)
-                .is_some());
+            assert!(
+                device_manager
+                    .get_device(DeviceType::Virtio(type_id), &id)
+                    .is_some()
+            );
             assert_eq!(
                 addr,
                 device_manager.id_to_dev_info[&(DeviceType::Virtio(type_id), id.clone())].addr
@@ -693,8 +701,10 @@ mod tests {
             );
         }
         let id = "bar";
-        assert!(device_manager
-            .get_device(DeviceType::Virtio(type_id), id)
-            .is_none());
+        assert!(
+            device_manager
+                .get_device(DeviceType::Virtio(type_id), id)
+                .is_none()
+        );
     }
 }

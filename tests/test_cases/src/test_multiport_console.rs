@@ -7,8 +7,8 @@ mod host {
     use super::*;
 
     use crate::common::setup_fs_and_enter;
-    use crate::{krun_call, krun_call_u32};
     use crate::{Test, TestSetup};
+    use crate::{krun_call, krun_call_u32};
     use krun_sys::*;
     use std::ffi::CString;
     use std::io::{BufRead, BufReader, Write};
@@ -50,10 +50,13 @@ mod host {
     impl Test for TestMultiportConsole {
         fn start_vm(self: Box<Self>, test_setup: TestSetup) -> anyhow::Result<()> {
             unsafe {
-                krun_call!(krun_set_log_level(KRUN_LOG_LEVEL_TRACE))?;
+                krun_call!(krun_init_log(
+                    KRUN_LOG_TARGET_DEFAULT,
+                    KRUN_LOG_LEVEL_TRACE,
+                    KRUN_LOG_STYLE_AUTO,
+                    0
+                ))?;
                 let ctx = krun_call_u32!(krun_create_ctx())?;
-
-                krun_call!(krun_disable_implicit_console(ctx))?;
 
                 // Add a default console (as with other tests this uses stdout for writing "OK")
                 krun_call!(krun_add_virtio_console_default(

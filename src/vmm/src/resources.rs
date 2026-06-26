@@ -7,8 +7,12 @@
 use std::fs::File;
 #[cfg(feature = "tee")]
 use std::io::BufReader;
+#[cfg(unix)]
 use std::os::fd::RawFd;
+#[cfg(feature = "tee")]
 use std::path::PathBuf;
+#[cfg(target_os = "windows")]
+use utils::windows::SendHandle;
 
 #[cfg(feature = "tee")]
 use serde::{Deserialize, Serialize};
@@ -39,6 +43,22 @@ type Result<E> = std::result::Result<(), E>;
 
 // Re-export TsiFlags from devices crate
 pub use devices::virtio::TsiFlags;
+
+#[cfg(feature = "vhost-user")]
+/// Configuration for a vhost-user device.
+#[derive(Debug, Clone)]
+pub struct VhostUserDeviceConfig {
+    /// Virtio device type ID (e.g., 4 for RNG, 25 for sound, 36 for CAN)
+    pub device_type: u32,
+    /// Path to the vhost-user Unix domain socket
+    pub socket_path: String,
+    /// Device name for logging/debugging (None = auto-generate from type)
+    pub name: Option<String>,
+    /// Number of virtqueues (0 = use device default)
+    pub num_queues: u16,
+    /// Size of each queue (empty = use device defaults)
+    pub queue_sizes: Vec<u16>,
+}
 
 /// Errors encountered when configuring microVM resources.
 #[derive(Debug)]
@@ -84,15 +104,30 @@ impl Default for TeeConfig {
     }
 }
 
+#[cfg(unix)]
 pub struct SerialConsoleConfig {
     pub input_fd: RawFd,
     pub output_fd: RawFd,
 }
 
+#[cfg(target_os = "windows")]
+pub struct SerialConsoleConfig {
+    pub input_handle: SendHandle,
+    pub output_handle: SendHandle,
+}
+
+#[cfg(unix)]
 pub struct DefaultVirtioConsoleConfig {
     pub input_fd: RawFd,
     pub output_fd: RawFd,
     pub err_fd: RawFd,
+}
+
+#[cfg(target_os = "windows")]
+pub struct DefaultVirtioConsoleConfig {
+    pub input_handle: SendHandle,
+    pub output_handle: SendHandle,
+    pub err_handle: SendHandle,
 }
 
 pub enum VirtioConsoleConfigMode {
@@ -100,6 +135,7 @@ pub enum VirtioConsoleConfigMode {
     Explicit(Vec<PortConfig>),
 }
 
+#[cfg(unix)]
 pub enum PortConfig {
     Tty {
         name: String,
@@ -112,16 +148,27 @@ pub enum PortConfig {
     },
 }
 
+#[cfg(windows)]
+pub enum PortConfig {
+    Tty {
+        name: String,
+        tty_handle: SendHandle,
+    },
+    InOut {
+        name: String,
+        input_handle: SendHandle,
+        output_handle: SendHandle,
+    },
+}
+
 /// Configuration for the vsock device
 #[derive(Debug, Default, Clone, Eq, PartialEq)]
 pub enum VsockConfig {
-    /// Default behavior - vsock created implicitly with heuristics-based TSI
+    /// No vsock device
     #[default]
-    Implicit,
+    Disabled,
     /// Explicit configuration with specified TSI features
     Explicit { tsi_flags: TsiFlags },
-    /// Vsock device disabled
-    Disabled,
 }
 
 /// A data structure that encapsulates the device configurations
@@ -170,19 +217,15 @@ pub struct VmResources {
         krun_input::InputConfigBackend<'static>,
         krun_input::InputEventProviderBackend<'static>,
     )>,
-    #[cfg(feature = "snd")]
-    /// Enable the virtio-snd device.
-    pub snd_device: bool,
-    /// File to send console output.
-    pub console_output: Option<PathBuf>,
+    #[cfg(feature = "vhost-user")]
+    /// Vhost-user device configurations
+    pub vhost_user_devices: Vec<VhostUserDeviceConfig>,
     /// SMBIOS OEM Strings
     pub smbios_oem_strings: Option<Vec<String>>,
     /// Whether to enable nested virtualization.
     pub nested_enabled: bool,
     /// Whether to enable split irqchip
     pub split_irqchip: bool,
-    /// Do not create an implicit console device in the guest
-    pub disable_implicit_console: bool,
     /// The console id to use for console= in the kernel cmdline
     pub kernel_console: Option<String>,
     /// Serial consoles to attach to the guest
@@ -342,15 +385,6 @@ impl VmResources {
         self.gpu_shm_size = Some(shm_size);
     }
 
-    #[cfg(feature = "snd")]
-    pub fn set_snd_device(&mut self, enabled: bool) {
-        self.snd_device = enabled;
-    }
-
-    pub fn set_console_output(&mut self, console_output: PathBuf) {
-        self.console_output = Some(console_output);
-    }
-
     /// Sets a network device to be attached when the VM starts.
     #[cfg(feature = "net")]
     pub fn add_network_interface(
@@ -389,12 +423,10 @@ impl VmResources {
 
 #[cfg(test)]
 mod tests {
-    #[cfg(feature = "gpu")]
-    use crate::resources::DisplayBackendConfig;
     use crate::resources::VmResources;
     use crate::vmm_config::kernel_cmdline::KernelCmdlineConfig;
     use crate::vmm_config::machine_config::{CpuFeaturesTemplate, VmConfig, VmConfigError};
-    use crate::vmm_config::vsock::tests::{default_config, TempSockFile};
+    use crate::vmm_config::vsock::tests::{TempSockFile, default_config};
     use crate::vstate::VcpuConfig;
     use utils::tempfile::TempFile;
 
@@ -415,8 +447,10 @@ mod tests {
             external_kernel: None,
             fs: Default::default(),
             vsock: Default::default(),
+            #[cfg(feature = "blk")]
+            block: Default::default(),
             #[cfg(feature = "net")]
-            net_builder: Default::default(),
+            net: Default::default(),
             gpu_virgl_flags: None,
             gpu_shm_size: None,
             #[cfg(feature = "gpu")]
@@ -425,13 +459,11 @@ mod tests {
             displays: Vec::new(),
             #[cfg(feature = "input")]
             input_backends: Vec::new(),
-            #[cfg(feature = "snd")]
-            snd_device: false,
-            console_output: None,
+            #[cfg(feature = "vhost-user")]
+            vhost_user_devices: Vec::new(),
             smbios_oem_strings: None,
             nested_enabled: false,
             split_irqchip: false,
-            disable_implicit_console: false,
             serial_consoles: Vec::new(),
             virtio_consoles: Vec::new(),
             kernel_console: None,
@@ -446,6 +478,7 @@ mod tests {
             vcpu_count: vm_resources.vm_config().vcpu_count.unwrap(),
             ht_enabled: vm_resources.vm_config().ht_enabled.unwrap(),
             cpu_template: vm_resources.vm_config().cpu_template,
+            #[cfg(target_os = "linux")]
             nested_enabled: vm_resources.nested_enabled,
         };
 

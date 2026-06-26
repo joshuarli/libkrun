@@ -9,8 +9,8 @@ use virtio_bindings::virtio_input;
 use vm_memory::{ByteValued, GuestMemoryMmap};
 
 use super::super::DeviceQueue;
-use crate::virtio::descriptor_utils::{Reader, Writer};
 use crate::virtio::InterruptTransport;
+use crate::virtio::descriptor_utils::{Reader, Writer};
 use krun_input::{InputEventProviderBackend, InputEventProviderInstance, InputEventsImpl};
 
 // Create a wrapper type to work around orphan rules
@@ -76,7 +76,7 @@ impl InputWorker {
         const EVENTQ_USER: u64 = 3;
         const QUIT: u64 = 4;
         // Set up epoll to wait for events
-        let epoll = Epoll::new().expect("Failed to create epoll");
+        let mut epoll = Epoll::new().expect("Failed to create epoll");
 
         let ready_fd = match events_instance.get_read_notify_fd() {
             Ok(fd) => fd,

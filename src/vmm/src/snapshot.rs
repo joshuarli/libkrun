@@ -134,8 +134,8 @@ pub fn copy_guest_memory(src: &GuestMemoryMmap, dst: &GuestMemoryMmap) -> io::Re
 #[cfg(target_os = "linux")]
 pub fn cow_clone_guest_memory(parent: &GuestMemoryMmap) -> std::io::Result<GuestMemoryMmap> {
     use std::os::fd::AsRawFd;
-    use vm_memory::mmap::MmapRegion;
     use vm_memory::GuestRegionMmap;
+    use vm_memory::mmap::MmapRegion;
 
     let prot = libc::PROT_READ | libc::PROT_WRITE;
     let io_err = |m: String| io::Error::other(m);
@@ -286,8 +286,8 @@ pub fn open_cow_memory_from_pid(
     descs: &[MemfdRegionDesc],
 ) -> io::Result<GuestMemoryMmap> {
     use std::os::fd::AsRawFd;
-    use vm_memory::mmap::MmapRegion;
     use vm_memory::GuestRegionMmap;
+    use vm_memory::mmap::MmapRegion;
 
     let prot = libc::PROT_READ | libc::PROT_WRITE;
     let io_err = |m: String| io::Error::other(m);
@@ -343,8 +343,8 @@ pub fn open_cow_memory_from_pid(
 #[cfg(target_os = "macos")]
 pub fn open_cow_memory_from_paths(descs: &[MemfdRegionDesc]) -> io::Result<GuestMemoryMmap> {
     use std::os::fd::AsRawFd;
-    use vm_memory::mmap::MmapRegion;
     use vm_memory::GuestRegionMmap;
+    use vm_memory::mmap::MmapRegion;
 
     let prot = libc::PROT_READ | libc::PROT_WRITE;
     let io_err = |m: String| io::Error::other(m);
@@ -543,8 +543,8 @@ mod tests {
 
         let added = rss_bytes().saturating_sub(rss_before);
         let naive = (N * base) as u64; // what 8 full copies would cost (512 MiB)
-                                       // Clones should add only ~N MiB (their dirtied pages) + slop, far below
-                                       // a naive 512 MiB. Generous bound to stay robust across machines.
+        // Clones should add only ~N MiB (their dirtied pages) + slop, far below
+        // a naive 512 MiB. Generous bound to stay robust across machines.
         assert!(
             added < 64 * 1024 * 1024,
             "8 CoW clones of 64 MiB added {added} bytes (naive full copy = {naive}); \

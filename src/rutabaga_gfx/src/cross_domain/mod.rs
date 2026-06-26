@@ -6,18 +6,18 @@
 //! boundaries.
 
 #[cfg(feature = "x")]
-use libc::{c_int, FUTEX_WAKE_BITSET};
+use libc::{FUTEX_WAKE_BITSET, c_int};
 use libc::{O_ACCMODE, O_WRONLY};
 use log::{error, info};
-use nix::fcntl::{fcntl, FcntlArg};
+use nix::fcntl::{FcntlArg, fcntl};
 #[cfg(feature = "x")]
-use nix::sys::mman::{mmap, munmap, MapFlags, ProtFlags};
+use nix::sys::mman::{MapFlags, ProtFlags, mmap, munmap};
 use std::cmp::max;
 use std::collections::BTreeMap as Map;
 use std::collections::VecDeque;
 use std::convert::TryInto;
 use std::ffi::c_void;
-use std::fs::{read_link, File};
+use std::fs::{File, read_link};
 use std::io::{Seek, SeekFrom};
 use std::mem::size_of;
 use std::os::fd::AsFd;
@@ -25,38 +25,38 @@ use std::os::fd::AsRawFd;
 #[cfg(feature = "x")]
 use std::ptr;
 use std::ptr::NonNull;
-use std::sync::atomic::AtomicBool;
-#[cfg(feature = "x")]
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use std::sync::Condvar;
 use std::sync::Mutex;
+use std::sync::atomic::AtomicBool;
+#[cfg(feature = "x")]
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::thread;
 use zerocopy::FromBytes;
 use zerocopy::Immutable;
 use zerocopy::IntoBytes;
 
+use crate::DrmFormat;
+use crate::ImageAllocationInfo;
+use crate::ImageMemoryRequirements;
+use crate::RutabagaGralloc;
+use crate::RutabagaGrallocFlags;
 use crate::cross_domain::cross_domain_protocol::*;
+use crate::cross_domain::sys::Receiver;
+use crate::cross_domain::sys::Sender;
+use crate::cross_domain::sys::SystemStream;
+use crate::cross_domain::sys::WaitContext;
 use crate::cross_domain::sys::channel;
 use crate::cross_domain::sys::channel_signal;
 use crate::cross_domain::sys::channel_wait;
 use crate::cross_domain::sys::read_volatile;
 use crate::cross_domain::sys::write_volatile;
-use crate::cross_domain::sys::Receiver;
-use crate::cross_domain::sys::Sender;
-use crate::cross_domain::sys::SystemStream;
-use crate::cross_domain::sys::WaitContext;
 use crate::rutabaga_core::ExportTable;
 use crate::rutabaga_core::RutabagaComponent;
 use crate::rutabaga_core::RutabagaContext;
 use crate::rutabaga_core::RutabagaResource;
 use crate::rutabaga_os::SafeDescriptor;
 use crate::rutabaga_utils::*;
-use crate::DrmFormat;
-use crate::ImageAllocationInfo;
-use crate::ImageMemoryRequirements;
-use crate::RutabagaGralloc;
-use crate::RutabagaGrallocFlags;
 
 mod cross_domain_protocol;
 mod sys;
@@ -481,7 +481,7 @@ impl CrossDomainWorker {
                         .ok_or(RutabagaError::InvalidCrossDomainItemId)?;
 
                     match item {
-                        CrossDomainItem::WaylandReadPipe(ref mut file) => {
+                        CrossDomainItem::WaylandReadPipe(file) => {
                             let ring_write =
                                 RingWrite::WriteFromFile(cmd_read, file, event.readable);
                             bytes_read = self.state.write_to_ring::<CrossDomainReadWrite>(
@@ -517,7 +517,7 @@ impl CrossDomainWorker {
                         .ok_or(RutabagaError::InvalidCrossDomainItemId)?;
 
                     match item {
-                        CrossDomainItem::Eventfd(ref mut file) => {
+                        CrossDomainItem::Eventfd(file) => {
                             let ring_write =
                                 RingWrite::WriteFromFile(cmd_read, file, event.readable);
                             self.state.write_to_ring::<CrossDomainReadWrite>(
@@ -965,34 +965,47 @@ impl CrossDomainContext {
     }
 
     fn write(&self, cmd_write: &CrossDomainReadWrite, opaque_data: &[u8]) -> RutabagaResult<()> {
-        let mut items = self.item_state.lock().unwrap();
-
-        // Most of the time, hang-up and writing will be paired.  In lieu of this, remove the
-        // item rather than getting a reference.  In case of an error, there's not much to do
-        // besides reporting it.
-        let item = items
-            .table
-            .remove(&cmd_write.identifier)
-            .ok_or(RutabagaError::InvalidCrossDomainItemId)?;
-
         let len: usize = cmd_write.opaque_data_size.try_into()?;
-        match item {
-            CrossDomainItem::WaylandWritePipe(file) => {
-                if len != 0 {
-                    write_volatile(&file, opaque_data)?;
-                }
 
-                if cmd_write.hang_up == 0 {
-                    items.table.insert(
-                        cmd_write.identifier,
-                        CrossDomainItem::WaylandWritePipe(file),
-                    );
+        // Phase 1 (under lock): look up the item and dup() its fd. We release
+        // the lock before the actual write syscall so unrelated operations on
+        // item_state aren't serialized behind it. The previous design held
+        // the lock across write_volatile, which was the dominant contention
+        // source for per-period eventfd writes from active audio streams
+        // competing with concurrent stream-create churn (process_receive's
+        // add_item path also takes this lock). Cloning the fd is a cheap
+        // dup() syscall; the actual write — which can be longer for pipe
+        // writes, and rate-limited for eventfds — happens lock-free.
+        let fd = {
+            let items = self.item_state.lock().unwrap();
+            let item = items
+                .table
+                .get(&cmd_write.identifier)
+                .ok_or(RutabagaError::InvalidCrossDomainItemId)?;
+            match item {
+                CrossDomainItem::WaylandWritePipe(file) | CrossDomainItem::Eventfd(file) => {
+                    file.try_clone()?
                 }
-
-                Ok(())
+                _ => return Err(RutabagaError::InvalidCrossDomainItemType),
             }
-            _ => Err(RutabagaError::InvalidCrossDomainItemType),
+        };
+
+        // Phase 2 (lock-free): do the actual write.
+        if len != 0 {
+            write_volatile(&fd, opaque_data)?;
         }
+
+        // Phase 3 (under lock): on hang_up, drop the item from the table.
+        // Without hang_up the item stays — common for Eventfd repeated wakeups
+        // and for any pipe being held open for further writes. This matches
+        // the previous "remove + conditional re-insert" behavior, but in the
+        // common (hang_up == 0) case avoids touching the table at all.
+        if cmd_write.hang_up != 0 {
+            let mut items = self.item_state.lock().unwrap();
+            items.table.remove(&cmd_write.identifier);
+        }
+
+        Ok(())
     }
 
     fn process_cmd_send<T: CrossDomainSendReceiveBase, const MAX_IDENTIFIERS: usize>(

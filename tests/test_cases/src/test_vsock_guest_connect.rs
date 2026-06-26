@@ -1,3 +1,5 @@
+#![cfg(any(feature = "host", target_os = "linux"))]
+
 use macros::{guest, host};
 use std::io::{ErrorKind, Read};
 use std::os::unix::net::UnixStream;
@@ -34,11 +36,12 @@ mod host {
     use super::*;
 
     use crate::common::setup_fs_and_enter;
-    use crate::{krun_call, krun_call_u32};
     use crate::{Test, TestSetup};
+    use crate::{krun_call, krun_call_u32};
     use krun_sys::*;
     use std::ffi::CString;
     use std::io::Write;
+    use std::os::fd::AsRawFd;
     use std::os::unix::net::UnixListener;
     use std::os::unix::prelude::OsStrExt;
     use std::{mem, thread};
@@ -63,14 +66,26 @@ mod host {
 
             thread::spawn(move || server(listener));
             unsafe {
-                krun_call!(krun_set_log_level(KRUN_LOG_LEVEL_TRACE))?;
+                krun_call!(krun_init_log(
+                    KRUN_LOG_TARGET_DEFAULT,
+                    KRUN_LOG_LEVEL_TRACE,
+                    KRUN_LOG_STYLE_AUTO,
+                    0
+                ))?;
                 let ctx = krun_call_u32!(krun_create_ctx())?;
+                krun_call!(krun_add_vsock(ctx, 0))?;
                 krun_call!(krun_add_vsock_port(
                     ctx,
                     VSOCK_PORT,
                     sock_path_cstr.as_ptr()
                 ))?;
                 krun_call!(krun_set_vm_config(ctx, 1, 1024))?;
+                krun_call!(krun_add_virtio_console_default(
+                    ctx,
+                    std::io::stdin().as_raw_fd(),
+                    std::io::stdout().as_raw_fd(),
+                    std::io::stderr().as_raw_fd(),
+                ))?;
                 setup_fs_and_enter(ctx, test_setup)?;
             }
             Ok(())
@@ -84,7 +99,7 @@ mod guest {
     use crate::Test;
 
     use nix::libc::VMADDR_CID_HOST;
-    use nix::sys::socket::{connect, socket, AddressFamily, SockFlag, SockType, VsockAddr};
+    use nix::sys::socket::{AddressFamily, SockFlag, SockType, VsockAddr, connect, socket};
     use std::io::Write;
     use std::os::fd::AsRawFd;
 

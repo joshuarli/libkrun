@@ -19,9 +19,9 @@ use std::os::unix::io::AsRawFd;
 use std::panic::catch_unwind;
 use std::process::abort;
 use std::ptr::null_mut;
+use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
-use std::sync::Arc;
 
 use log::debug;
 use log::error;
@@ -212,7 +212,7 @@ extern "C" fn write_context_fence(cookie: *mut c_void, ctx_id: u32, ring_idx: u6
 unsafe extern "C" fn write_fence(cookie: *mut c_void, fence: u32) {
     catch_unwind(|| {
         assert!(!cookie.is_null());
-        let cookie = &*(cookie as *mut RutabagaCookie);
+        let cookie = unsafe { &*(cookie as *mut RutabagaCookie) };
 
         // Call fence completion callback
         if let Some(handler) = &cookie.fence_handler {
@@ -231,7 +231,7 @@ unsafe extern "C" fn write_fence(cookie: *mut c_void, fence: u32) {
 unsafe extern "C" fn get_server_fd(cookie: *mut c_void, version: u32) -> c_int {
     catch_unwind(|| {
         assert!(!cookie.is_null());
-        let cookie = &mut *(cookie as *mut RutabagaCookie);
+        let cookie = unsafe { &mut *(cookie as *mut RutabagaCookie) };
 
         log::info!(
             "get_server_fd called: version={version}, has_fd={}",
@@ -504,20 +504,16 @@ impl RutabagaComponent for VirglRenderer {
         // virgl_renderer_context_destroy, so callers must deregister it from any
         // poll set before calling destroy.
         let fd = unsafe { virgl_renderer_context_get_poll_fd(ctx_id) };
-        if fd >= 0 {
-            Some(fd)
-        } else {
-            None
-        }
+        if fd >= 0 { Some(fd) } else { None }
     }
 
     fn poll_descriptor(&self) -> Option<SafeDescriptor> {
         // Safe because it can be called anytime and returns -1 in the event of an error.
         let fd = unsafe { virgl_renderer_get_poll_fd() };
-        if fd >= 0 {
-            if let Ok(dup_fd) = SafeDescriptor::try_from(&fd as &dyn AsRawFd) {
-                return Some(dup_fd);
-            }
+        if fd >= 0
+            && let Ok(dup_fd) = SafeDescriptor::try_from(&fd as &dyn AsRawFd)
+        {
+            return Some(dup_fd);
         }
         None
     }

@@ -10,7 +10,7 @@ use std::os::unix::io::AsRawFd;
 use polly::event_manager::{EventManager, Subscriber};
 use utils::epoll::{EpollEvent, EventSet};
 
-use super::device::{Vsock, EVQ_INDEX, RXQ_INDEX, TXQ_INDEX};
+use super::device::{EVQ_INDEX, RXQ_INDEX, TXQ_INDEX, Vsock};
 use crate::virtio::VirtioDevice;
 
 impl Vsock {
@@ -93,7 +93,9 @@ impl Vsock {
     }
 
     fn handle_activate_event(&self, event_manager: &mut EventManager) {
-        info!("[VSOCK_TIMING] handle_activate_event called - registering RX/TX queues with event manager");
+        info!(
+            "[VSOCK_TIMING] handle_activate_event called - registering RX/TX queues with event manager"
+        );
         debug!("activate event");
         if let Err(e) = self.activate_evt.read() {
             error!("Failed to consume vsock activate event: {e:?}");

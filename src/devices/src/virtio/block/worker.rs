@@ -5,11 +5,14 @@ use super::device::{CacheType, DiskProperties};
 
 use crate::virtio::InterruptTransport;
 use std::io::{self, Write};
+#[cfg(unix)]
 use std::os::fd::AsRawFd;
 use std::result;
 use std::thread;
 use utils::epoll::{ControlOperation, Epoll, EpollEvent, EventSet};
 use utils::eventfd::EventFd;
+#[cfg(target_os = "windows")]
+use utils::windows::AsRawFd;
 use virtio_bindings::virtio_blk::*;
 use vm_memory::{ByteValued, GuestMemoryMmap};
 
@@ -110,7 +113,7 @@ impl BlockWorker {
         let virtq_ev_fd = self.device_queue.event.as_raw_fd();
         let stop_ev_fd = self.stop_fd.as_raw_fd();
 
-        let epoll = Epoll::new().unwrap();
+        let mut epoll = Epoll::new().unwrap();
 
         let _ = epoll.ctl(
             ControlOperation::Add,
@@ -124,8 +127,8 @@ impl BlockWorker {
             &EpollEvent::new(EventSet::IN, stop_ev_fd as u64),
         );
 
+        let mut epoll_events = vec![EpollEvent::new(EventSet::empty(), 0); 32];
         loop {
-            let mut epoll_events = vec![EpollEvent::new(EventSet::empty(), 0); 32];
             match epoll.wait(epoll_events.len(), -1, epoll_events.as_mut_slice()) {
                 Ok(ev_cnt) => {
                     for event in &epoll_events[0..ev_cnt] {
@@ -234,10 +237,8 @@ impl BlockWorker {
         // Signal once after draining all block requests rather than per-request,
         // avoiding redundant IRQ signals when multiple descriptors complete in
         // a single epoll wake-up.
-        if signal_needed {
-            if let Err(e) = self.interrupt.try_signal_used_queue() {
-                error!("error signalling queue: {e:?}");
-            }
+        if signal_needed && let Err(e) = self.interrupt.try_signal_used_queue() {
+            error!("error signalling queue: {e:?}");
         }
     }
 

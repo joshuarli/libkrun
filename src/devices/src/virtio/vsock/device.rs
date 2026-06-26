@@ -18,13 +18,13 @@ use super::super::{
     ActivateError, ActivateResult, DeviceQueue, DeviceState, Queue as VirtQueue, QueueConfig,
     VirtioDevice,
 };
+use super::TsiFlags;
 use super::muxer::VsockMuxer;
 use super::packet::VsockPacket;
 use super::proxy::ListenerDesc;
-use super::TsiFlags;
 use super::{defs, defs::uapi};
-use crate::virtio::queue::QueueState;
 use crate::virtio::InterruptTransport;
+use crate::virtio::queue::QueueState;
 
 pub(crate) const RXQ_INDEX: usize = 0;
 pub(crate) const TXQ_INDEX: usize = 1;

@@ -54,6 +54,11 @@ bitflags! {
 #[derive(Clone, Copy)]
 pub struct Kevent(libc::kevent);
 
+// Safety: udata is used as an integer tag (cast from u64), never dereferenced.
+// Needed because libc::kevent contains *mut c_void which is !Send, making
+// Vec<Kevent> !Send which in turn makes Epoll !Send which is unwanted.
+unsafe impl Send for Kevent {}
+
 impl std::fmt::Debug for Kevent {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{{ ident: {}, data: {} }}", self.ident(), self.data())
@@ -140,9 +145,19 @@ impl EpollEvent {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct Epoll {
     queue: RawFd,
+    kevs: Vec<Kevent>,
+}
+
+impl Clone for Epoll {
+    fn clone(&self) -> Self {
+        Epoll {
+            queue: self.queue,
+            kevs: Vec::new(),
+        }
+    }
 }
 
 impl Epoll {
@@ -151,7 +166,10 @@ impl Epoll {
         if queue == -1 {
             Err(io::Error::last_os_error())
         } else {
-            Ok(Epoll { queue })
+            Ok(Epoll {
+                queue,
+                kevs: Vec::new(),
+            })
         }
     }
 
@@ -258,11 +276,13 @@ impl Epoll {
     }
 
     pub fn wait(
-        &self,
+        &mut self,
         max_events: usize,
         timeout: i32,
         events: &mut [EpollEvent],
     ) -> io::Result<usize> {
+        let max_events = events.len().min(max_events).min(i32::MAX as usize);
+
         // Convert millisecond timeout to timespec. For timeout = -1 (infinite),
         // use a 3-second periodic wakeup to avoid blocking the muxer thread
         // indefinitely — it needs periodic wakeups for housekeeping.
@@ -278,14 +298,16 @@ impl Epoll {
             }
         };
 
-        let mut kevs = vec![Kevent::default(); events.len()];
-        debug!("kevs len: {}", kevs.len());
+        self.kevs.clear();
+        self.kevs.reserve_exact(max_events);
+        let spare = self.kevs.spare_capacity_mut();
+        debug_assert!(spare.len() >= max_events);
         let ret = unsafe {
             libc::kevent(
                 self.queue,
                 ptr::null(),
                 0,
-                kevs.as_mut_ptr() as *mut libc::kevent,
+                spare.as_mut_ptr().cast::<libc::kevent>(),
                 max_events as i32,
                 &ts as *const libc::timespec,
             )
@@ -298,6 +320,9 @@ impl Epoll {
         }
 
         let nevents = ret as usize;
+        // Safety: kevent() initialized the first `nevents` elements of spare capacity.
+        unsafe { self.kevs.set_len(nevents) };
+        let kevs = &self.kevs;
 
         for i in 0..nevents {
             if kevs[i].0.filter == libc::EVFILT_READ {
@@ -353,7 +378,7 @@ impl AsRawFd for Epoll {
 mod tests {
     use super::*;
 
-    use crate::eventfd::{EventFd, EFD_NONBLOCK};
+    use crate::eventfd::{EFD_NONBLOCK, EventFd};
 
     #[test]
     fn test_event_ops() {
@@ -381,7 +406,7 @@ mod tests {
         const EVENT_BUFFER_SIZE: usize = 128;
         const MAX_EVENTS: usize = 10;
 
-        let epoll = Epoll::new().unwrap();
+        let mut epoll = Epoll::new().unwrap();
         assert_eq!(epoll.queue, epoll.as_raw_fd());
 
         // Let's test different scenarios for `epoll_ctl()` and `epoll_wait()` functionality.
@@ -397,25 +422,29 @@ mod tests {
 
         // For EPOLL_CTL_ADD behavior we will try to add some fds with different event masks into
         // the interest list of epoll instance.
-        assert!(epoll
-            .ctl(
-                ControlOperation::Add,
-                event_fd_1.as_raw_fd() as i32,
-                &event_1
-            )
-            .is_ok());
+        assert!(
+            epoll
+                .ctl(
+                    ControlOperation::Add,
+                    event_fd_1.as_raw_fd() as i32,
+                    &event_1
+                )
+                .is_ok()
+        );
 
         let event_fd_2 = EventFd::new(EFD_NONBLOCK).unwrap();
         event_fd_2.write(1).unwrap();
-        assert!(epoll
-            .ctl(
-                ControlOperation::Add,
-                event_fd_2.as_raw_fd() as i32,
-                // For this fd, we want an Event instance that has `data` field set to other
-                // value than the value of the fd and `events` without EPOLLIN type set.
-                &EpollEvent::new(EventSet::IN, 10)
-            )
-            .is_ok());
+        assert!(
+            epoll
+                .ctl(
+                    ControlOperation::Add,
+                    event_fd_2.as_raw_fd() as i32,
+                    // For this fd, we want an Event instance that has `data` field set to other
+                    // value than the value of the fd and `events` without EPOLLIN type set.
+                    &EpollEvent::new(EventSet::IN, 10)
+                )
+                .is_ok()
+        );
 
         // Let's check `epoll_wait()` behavior for our epoll instance.
         let mut ready_events = vec![EpollEvent::default(); EVENT_BUFFER_SIZE];
@@ -436,13 +465,15 @@ mod tests {
         assert_eq!(ready_events[1].events(), EventSet::IN.bits());
 
         // Let's also delete a fd from the interest list.
-        assert!(epoll
-            .ctl(
-                ControlOperation::Delete,
-                event_fd_2.as_raw_fd() as i32,
-                &EpollEvent::default()
-            )
-            .is_ok());
+        assert!(
+            epoll
+                .ctl(
+                    ControlOperation::Delete,
+                    event_fd_2.as_raw_fd() as i32,
+                    &EpollEvent::default()
+                )
+                .is_ok()
+        );
 
         // We expect to have only one fd remained in the ready list (event_fd_3).
         ev_count = epoll

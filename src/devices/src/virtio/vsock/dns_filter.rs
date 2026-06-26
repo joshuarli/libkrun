@@ -30,7 +30,7 @@ use nix::sys::socket::SockaddrStorage;
 use vm_memory::GuestMemoryMmap;
 
 use super::super::Queue as VirtQueue;
-use super::muxer::{push_packet, MuxerRx};
+use super::muxer::{MuxerRx, push_packet};
 use super::muxer_rxq::MuxerRxQ;
 use crate::virtio::InterruptTransport;
 
@@ -278,10 +278,10 @@ fn handle_dns_query(policy: &Arc<RwLock<EgressPolicy>>, query: &[u8]) -> Vec<u8>
         let target = SocketAddr::new(resolver, DNS_PORT);
         match forward_dns_udp(query, target) {
             Ok(response) => {
-                if let Ok(ips) = parse_answer_ips(&response) {
-                    if let Ok(mut policy) = policy.write() {
-                        policy.learn_ips(ips);
-                    }
+                if let Ok(ips) = parse_answer_ips(&response)
+                    && let Ok(mut policy) = policy.write()
+                {
+                    policy.learn_ips(ips);
                 }
                 return response;
             }
@@ -622,17 +622,21 @@ mod tests {
     #[test]
     fn dns_active_requires_hosts_and_resolvers() {
         // hosts but no resolvers → not active
-        assert!(!EgressPolicy::new(None, Some(vec!["a.com".into()]), None)
-            .unwrap()
-            .dns_active());
+        assert!(
+            !EgressPolicy::new(None, Some(vec!["a.com".into()]), None)
+                .unwrap()
+                .dns_active()
+        );
         // cidrs only → not active
-        assert!(!EgressPolicy::new(
-            Some(vec![(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 0)), 8)]),
-            None,
-            None
-        )
-        .unwrap()
-        .dns_active());
+        assert!(
+            !EgressPolicy::new(
+                Some(vec![(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 0)), 8)]),
+                None,
+                None
+            )
+            .unwrap()
+            .dns_active()
+        );
         // both → active
         assert!(host_policy(vec!["a.com"]).dns_active());
     }

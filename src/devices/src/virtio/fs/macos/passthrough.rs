@@ -2,13 +2,13 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
-use std::collections::btree_map;
 use std::collections::BTreeMap;
 use std::collections::HashMap;
+use std::collections::btree_map;
 use std::ffi::{CStr, CString};
 use std::fs::File;
 use std::io;
-use std::mem::{self, MaybeUninit};
+use std::mem::MaybeUninit;
 use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
 use std::ptr::null_mut;
 use std::str::FromStr;
@@ -16,23 +16,23 @@ use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
-use crossbeam_channel::{unbounded, Sender};
+use crossbeam_channel::{Sender, unbounded};
 use nix::errno::Errno;
 use utils::worker_message::WorkerMessage;
 
 use crate::virtio::fs::filesystem::SecContext;
 
-use super::super::super::linux_errno::{linux_error, LINUX_ERANGE};
+use super::super::super::linux_errno::{LINUX_ERANGE, linux_error};
 use super::super::bindings;
 use super::super::filesystem::{
     Context, DirEntry, Entry, ExportTable, Extensions, FileSystem, FsOptions, GetxattrReply,
     ListxattrReply, OpenOptions, SetattrValid, ZeroCopyReader, ZeroCopyWriter,
 };
 use super::super::fuse;
+use super::super::inode_alloc::InodeAllocator;
 use super::super::multikey::MultikeyBTreeMap;
 use super::super::{FuseHandleSnap, FuseInodeSnap, FuseServerState};
 
-const INIT_CSTR: &[u8] = b"init.krun\0";
 const XATTR_KEY: &[u8] = b"user.containers.override_stat\0";
 const SECURITY_CAPABILITY: &[u8] = b"security.capability\0";
 
@@ -48,8 +48,6 @@ const SECURITY_CAPABILITY: &[u8] = b"security.capability\0";
 const MACOS_XATTR_PREFIX: &[u8] = b"com.apple.";
 
 const UID_MAX: u32 = u32::MAX - 1;
-
-static INIT_BINARY: &[u8] = include_bytes!(env!("KRUN_INIT_BINARY_PATH"));
 
 type Inode = u64;
 type Handle = u64;
@@ -175,6 +173,16 @@ fn einval() -> io::Error {
     linux_error(io::Error::from_raw_os_error(libc::EINVAL))
 }
 
+fn host_euid() -> u32 {
+    static EUID: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *EUID.get_or_init(|| unsafe { libc::geteuid() })
+}
+
+fn host_egid() -> u32 {
+    static EGID: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *EGID.get_or_init(|| unsafe { libc::getegid() })
+}
+
 fn item_to_value(item: &[u8], radix: u32) -> Option<u32> {
     match std::str::from_utf8(item) {
         Ok(val) => match u32::from_str_radix(val, radix) {
@@ -268,10 +276,11 @@ fn get_xattr_lstat(
 }
 
 fn is_valid_owner(owner: Option<(u32, u32)>) -> bool {
-    if let Some(owner) = owner {
-        if owner.0 < UID_MAX && owner.1 < UID_MAX {
-            return true;
-        }
+    if let Some(owner) = owner
+        && owner.0 < UID_MAX
+        && owner.1 < UID_MAX
+    {
+        return true;
     }
 
     false
@@ -298,7 +307,7 @@ fn set_xattr_stat(
     } else {
         let (orig_uid, orig_gid, orig_mode) = match file {
             InodeHandle::Fd(fd) => get_xattr_fstat(*fd, st)?,
-            InodeHandle::Path(ref c_path) => get_xattr_lstat(c_path, st)?,
+            InodeHandle::Path(c_path) => get_xattr_lstat(c_path, st)?,
         };
 
         let (uid, gid) = match owner {
@@ -369,11 +378,21 @@ fn stat_common(
     host: bool,
 ) -> io::Result<bindings::stat64> {
     if !host {
-        if let Some(uid) = uid {
-            st.st_uid = uid;
+        match uid {
+            Some(uid) => st.st_uid = uid,
+            None => {
+                if st.st_uid == host_euid() {
+                    st.st_uid = 0;
+                }
+            }
         }
-        if let Some(gid) = gid {
-            st.st_gid = gid;
+        match gid {
+            Some(gid) => st.st_gid = gid,
+            None => {
+                if st.st_gid == host_egid() {
+                    st.st_gid = 0;
+                }
+            }
         }
         if let Some(mode) = mode {
             if mode as u16 & libc::S_IFMT == 0 {
@@ -430,7 +449,7 @@ fn lstat(c_path: &CString, host: bool) -> io::Result<bindings::stat64> {
 fn istat(ihandle: &InodeHandle, host: bool) -> io::Result<bindings::stat64> {
     match ihandle {
         InodeHandle::Fd(fd) => fstat(*fd, host),
-        InodeHandle::Path(ref c_path) => lstat(c_path, host),
+        InodeHandle::Path(c_path) => lstat(c_path, host),
     }
 }
 
@@ -528,6 +547,9 @@ pub struct Config {
     pub export_fsid: u64,
     /// Table of exported FDs to share with other subsystems. Not supported for macos.
     pub export_table: Option<ExportTable>,
+
+    /// Whether the guest may request deletion of the root directory via the
+    /// `VIRTIO_IOC_REMOVE_ROOT_DIR_REQ` ioctl. Defaults to `false`.
     pub allow_root_dir_delete: bool,
 }
 
@@ -555,12 +577,10 @@ impl Default for Config {
 /// combination of mount namespaces and the pivot_root system call.
 pub struct PassthroughFs {
     inodes: RwLock<MultikeyBTreeMap<Inode, InodeAltKey, Arc<InodeData>>>,
-    next_inode: AtomicU64,
-    init_inode: u64,
+    inode_alloc: Arc<InodeAllocator>,
 
     handles: RwLock<BTreeMap<Handle, Arc<HandleData>>>,
     next_handle: AtomicU64,
-    init_handle: u64,
 
     map_windows: Mutex<HashMap<u64, u64>>,
 
@@ -572,7 +592,7 @@ pub struct PassthroughFs {
 }
 
 impl PassthroughFs {
-    pub fn new(cfg: Config) -> io::Result<PassthroughFs> {
+    pub fn new(cfg: Config, inode_alloc: Arc<InodeAllocator>) -> io::Result<PassthroughFs> {
         let root = CString::new(cfg.root_dir.as_str()).expect("CString::new failed");
 
         // Safe because this doesn't modify any memory and we check the return value.
@@ -590,12 +610,10 @@ impl PassthroughFs {
 
         Ok(PassthroughFs {
             inodes: RwLock::new(MultikeyBTreeMap::new()),
-            next_inode: AtomicU64::new(fuse::ROOT_ID + 2),
-            init_inode: fuse::ROOT_ID + 1,
+            inode_alloc,
 
             handles: RwLock::new(BTreeMap::new()),
             next_handle: AtomicU64::new(1),
-            init_handle: 0,
 
             map_windows: Mutex::new(HashMap::new()),
 
@@ -659,7 +677,7 @@ impl PassthroughFs {
         {
             let inodes = self.inodes.read().unwrap();
             for (nodeid, data) in inodes.iter() {
-                if *nodeid == fuse::ROOT_ID || *nodeid == self.init_inode {
+                if *nodeid == fuse::ROOT_ID {
                     continue;
                 }
                 inode_snaps.push(FuseInodeSnap {
@@ -688,7 +706,7 @@ impl PassthroughFs {
         FuseServerState {
             inodes: inode_snaps,
             handles: handle_snaps,
-            next_inode: self.next_inode.load(Ordering::Relaxed),
+            next_inode: self.inode_alloc.current(),
             next_handle: self.next_handle.load(Ordering::Relaxed),
             writeback: self.writeback.load(Ordering::Relaxed),
             announce_submounts: self.announce_submounts.load(Ordering::Relaxed),
@@ -734,7 +752,7 @@ impl PassthroughFs {
 
         // Counters must be restored before reopening handles so newly-allocated
         // ids don't collide with the restored ones.
-        self.next_inode.store(state.next_inode, Ordering::Relaxed);
+        self.inode_alloc.restore(state.next_inode);
         self.next_handle.store(state.next_handle, Ordering::Relaxed);
         self.writeback.store(state.writeback, Ordering::Relaxed);
         self.announce_submounts
@@ -855,75 +873,6 @@ impl PassthroughFs {
         Ok(unsafe { File::from_raw_fd(fd) })
     }
 
-    fn do_lookup(&self, parent: Inode, name: &CStr) -> io::Result<Entry> {
-        let parent_data = self
-            .inodes
-            .read()
-            .unwrap()
-            .get(&parent)
-            .cloned()
-            .ok_or_else(ebadf)?;
-
-        let c_path = self.name_to_path(parent, name)?;
-        let st = lstat(&c_path, false)?;
-
-        debug!(
-            "do_lookup: inode={} path={}",
-            st.st_ino,
-            c_path.to_str().unwrap()
-        );
-        let mut attr_flags: u32 = 0;
-
-        if st.st_mode & libc::S_IFMT == libc::S_IFDIR
-            && self.announce_submounts.load(Ordering::Relaxed)
-            && (st.st_dev != parent_data.dev)
-        {
-            attr_flags |= fuse::ATTR_SUBMOUNT;
-        }
-
-        let altkey = InodeAltKey {
-            ino: st.st_ino,
-            dev: st.st_dev,
-        };
-        let data = self.inodes.read().unwrap().get_alt(&altkey).cloned();
-
-        let inode = if let Some(data) = data {
-            // Matches with the release store in `forget`.
-            data.refcount.fetch_add(1, Ordering::Acquire);
-            data.inode
-        } else {
-            // There is a possible race here where 2 threads end up adding the same file
-            // into the inode list.  However, since each of those will get a unique Inode
-            // value and unique file descriptors this shouldn't be that much of a problem.
-            let inode = self.next_inode.fetch_add(1, Ordering::Relaxed);
-            self.inodes.write().unwrap().insert(
-                inode,
-                InodeAltKey {
-                    ino: st.st_ino,
-                    dev: st.st_dev,
-                },
-                Arc::new(InodeData {
-                    inode,
-                    ino: st.st_ino,
-                    dev: st.st_dev,
-                    refcount: AtomicU64::new(1),
-                    unlinked_fd: AtomicI64::new(-1),
-                }),
-            );
-
-            inode
-        };
-
-        Ok(Entry {
-            inode,
-            generation: 0,
-            attr: st,
-            attr_flags,
-            attr_timeout: self.cfg.attr_timeout,
-            entry_timeout: self.cfg.entry_timeout,
-        })
-    }
-
     fn do_readdir<F>(
         &self,
         inode: Inode,
@@ -949,6 +898,16 @@ impl PassthroughFs {
             .ok_or_else(ebadf)?;
 
         let mut ds = data.dirstream.lock().unwrap();
+
+        // We use offset == 0 as an indicator of this being either a fresh directory
+        // stream or a stream that has been rewound. If that's the case, make sure
+        // the cache will be refreshed.
+        if offset == 0 && ds.ready {
+            let fd = data.file.write().unwrap().as_raw_fd();
+            unsafe { libc::lseek(fd, 0, libc::SEEK_SET) };
+            ds.entries.clear();
+            ds.ready = false;
+        }
 
         if !ds.ready {
             // Fill the cache on first call
@@ -1007,10 +966,10 @@ impl PassthroughFs {
 
             if let Ok(st) = fstat(fd, false) {
                 let new_mode = clear_suid_sgid(st.st_mode as u32);
-                if new_mode != st.st_mode as u32 {
-                    if let Err(err) = set_xattr_stat(&ihandle, Some(st), None, Some(new_mode)) {
-                        error!("Couldn't clear suid/sgid for inode {inode}: {err}");
-                    }
+                if new_mode != st.st_mode as u32
+                    && let Err(err) = set_xattr_stat(&ihandle, Some(st), None, Some(new_mode))
+                {
+                    error!("Couldn't clear suid/sgid for inode {inode}: {err}");
                 }
             }
         }
@@ -1044,13 +1003,13 @@ impl PassthroughFs {
     fn do_release(&self, inode: Inode, handle: Handle) -> io::Result<()> {
         let mut handles = self.handles.write().unwrap();
 
-        if let btree_map::Entry::Occupied(e) = handles.entry(handle) {
-            if e.get().inode == inode {
-                // We don't need to close the file here because that will happen automatically when
-                // the last `Arc` is dropped.
-                e.remove();
-                return Ok(());
-            }
+        if let btree_map::Entry::Occupied(e) = handles.entry(handle)
+            && e.get().inode == inode
+        {
+            // We don't need to close the file here because that will happen automatically when
+            // the last `Arc` is dropped.
+            e.remove();
+            return Ok(());
         }
 
         Err(ebadf())
@@ -1075,17 +1034,31 @@ impl PassthroughFs {
         Ok(fd)
     }
 
-    fn store_unlinked_fd(&self, unlinked_fd: RawFd) -> io::Result<()> {
+    fn store_unlinked_fd(&self, unlinked_fd: RawFd) -> io::Result<bool> {
         let st = fstat(unlinked_fd, true)?;
         let altkey = InodeAltKey {
             ino: st.st_ino,
             dev: st.st_dev,
         };
-        if let Some(data) = self.inodes.read().unwrap().get_alt(&altkey).cloned() {
-            data.unlinked_fd
-                .store(unlinked_fd as i64, Ordering::Release);
+        // Hold the read lock across the swap: dropping it earlier would let a
+        // concurrent `forget` remove this inode (closing its then-`-1`
+        // `unlinked_fd`) between our lookup and swap, leaking the fd we store.
+        let inodes = self.inodes.read().unwrap();
+        if let Some(data) = inodes.get_alt(&altkey) {
+            // Swap rather than store so that if this inode already had a
+            // preserved fd (e.g. another hard link was unlinked/overwritten
+            // earlier), we recover and close it instead of leaking it.
+            let old_fd = data.unlinked_fd.swap(unlinked_fd as i64, Ordering::AcqRel);
+            if old_fd >= 0 {
+                unsafe { libc::close(old_fd as RawFd) };
+            }
+            // The tracked inode now owns `unlinked_fd` (closed in `forget_one`).
+            Ok(true)
+        } else {
+            // No tracked inode for this (dev, ino): the caller keeps ownership
+            // of `unlinked_fd` and must close it to avoid a leak.
+            Ok(false)
         }
-        Ok(())
     }
 
     fn do_unlink(
@@ -1134,9 +1107,17 @@ impl PassthroughFs {
 
         if res == 0 {
             if let Some(unlinked_fd) = unlinked_fd {
-                if let Err(err) = self.store_unlinked_fd(unlinked_fd) {
-                    unsafe { libc::close(unlinked_fd) };
-                    warn!("Couldn't store unlinked fd \"{}\": {err}", unlinked_fd);
+                match self.store_unlinked_fd(unlinked_fd) {
+                    // The tracked inode took ownership of the fd.
+                    Ok(true) => {}
+                    // No tracked inode: we still own the fd and must close it.
+                    Ok(false) => unsafe {
+                        libc::close(unlinked_fd);
+                    },
+                    Err(err) => {
+                        unsafe { libc::close(unlinked_fd) };
+                        warn!("Couldn't store unlinked fd \"{}\": {err}", unlinked_fd);
+                    }
                 }
             }
             Ok(())
@@ -1259,7 +1240,7 @@ fn forget_one(
             // we don't want misbehaving clients to cause integer overflow.
             let new_count = refcount.saturating_sub(count);
 
-            // Synchronizes with the acquire load in `do_lookup`.
+            // Synchronizes with the acquire load in `lookup`.
             if data
                 .refcount
                 .compare_exchange(refcount, new_count, Ordering::Release, Ordering::Relaxed)
@@ -1335,26 +1316,73 @@ impl FileSystem for PassthroughFs {
     }
 
     fn lookup(&self, _ctx: Context, parent: Inode, name: &CStr) -> io::Result<Entry> {
-        debug!("lookup: {name:?}");
-        let _init_name = unsafe { CStr::from_bytes_with_nul_unchecked(INIT_CSTR) };
+        let parent_data = self
+            .inodes
+            .read()
+            .unwrap()
+            .get(&parent)
+            .cloned()
+            .ok_or_else(ebadf)?;
 
-        if self.init_inode != 0 && name == _init_name {
-            let mut st: bindings::stat64 = unsafe { mem::zeroed() };
-            st.st_size = INIT_BINARY.len() as i64;
-            st.st_ino = self.init_inode;
-            st.st_mode = 0o100_755;
+        let c_path = self.name_to_path(parent, name)?;
+        let st = lstat(&c_path, false)?;
 
-            Ok(Entry {
-                inode: self.init_inode,
-                generation: 0,
-                attr: st,
-                attr_flags: 0,
-                attr_timeout: self.cfg.attr_timeout,
-                entry_timeout: self.cfg.entry_timeout,
-            })
-        } else {
-            self.do_lookup(parent, name)
+        debug!(
+            "lookup: inode={} path={}",
+            st.st_ino,
+            c_path.to_str().unwrap()
+        );
+
+        let mut attr_flags: u32 = 0;
+
+        if st.st_mode & libc::S_IFMT == libc::S_IFDIR
+            && self.announce_submounts.load(Ordering::Relaxed)
+            && (st.st_dev != parent_data.dev)
+        {
+            attr_flags |= fuse::ATTR_SUBMOUNT;
         }
+
+        let altkey = InodeAltKey {
+            ino: st.st_ino,
+            dev: st.st_dev,
+        };
+        let data = self.inodes.read().unwrap().get_alt(&altkey).cloned();
+
+        let inode = if let Some(data) = data {
+            // Matches with the release store in `forget`.
+            data.refcount.fetch_add(1, Ordering::Acquire);
+            data.inode
+        } else {
+            // There is a possible race here where 2 threads end up adding the same file
+            // into the inode list.  However, since each of those will get a unique Inode
+            // value and unique file descriptors this shouldn't be that much of a problem.
+            let inode = self.inode_alloc.next();
+            self.inodes.write().unwrap().insert(
+                inode,
+                InodeAltKey {
+                    ino: st.st_ino,
+                    dev: st.st_dev,
+                },
+                Arc::new(InodeData {
+                    inode,
+                    ino: st.st_ino,
+                    dev: st.st_dev,
+                    refcount: AtomicU64::new(1),
+                    unlinked_fd: AtomicI64::new(-1),
+                }),
+            );
+
+            inode
+        };
+
+        Ok(Entry {
+            inode,
+            generation: 0,
+            attr: st,
+            attr_flags,
+            attr_timeout: self.cfg.attr_timeout,
+            entry_timeout: self.cfg.entry_timeout,
+        })
     }
 
     fn forget(&self, _ctx: Context, inode: Inode, count: u64) {
@@ -1416,7 +1444,7 @@ impl FileSystem for PassthroughFs {
                 Some((ctx.uid, ctx.gid)),
                 Some(mode & !umask),
             )?;
-            self.do_lookup(parent, name)
+            self.lookup(ctx, parent, name)
         } else {
             Err(linux_error(io::Error::last_os_error()))
         }
@@ -1443,7 +1471,7 @@ impl FileSystem for PassthroughFs {
 
     fn readdirplus<F>(
         &self,
-        _ctx: Context,
+        ctx: Context,
         inode: Inode,
         handle: Handle,
         size: u32,
@@ -1461,7 +1489,7 @@ impl FileSystem for PassthroughFs {
             // interior '\0' bytes. We trust the kernel to provide us with properly formatted data
             // so we'll just skip the checks here.
             let name = unsafe { CStr::from_bytes_with_nul_unchecked(dir_entry.name) };
-            let entry = self.do_lookup(inode, name)?;
+            let entry = self.lookup(ctx, inode, name)?;
 
             add_entry(dir_entry, entry)
         })
@@ -1474,11 +1502,7 @@ impl FileSystem for PassthroughFs {
         kill_priv: bool,
         flags: u32,
     ) -> io::Result<(Option<Handle>, OpenOptions)> {
-        if inode == self.init_inode {
-            Ok((Some(self.init_handle), OpenOptions::empty()))
-        } else {
-            self.do_open(inode, kill_priv, flags)
-        }
+        self.do_open(inode, kill_priv, flags)
     }
 
     fn release(
@@ -1506,6 +1530,7 @@ impl FileSystem for PassthroughFs {
         extensions: Extensions,
     ) -> io::Result<(Entry, Option<Handle>, OpenOptions)> {
         let c_path = self.name_to_path(parent, name)?;
+
         let flags = self.parse_open_flags(flags as i32);
         let hostmode = if (flags & libc::O_DIRECTORY) != 0 {
             0o700
@@ -1553,7 +1578,7 @@ impl FileSystem for PassthroughFs {
         // Safe because we just opened this fd.
         let file = RwLock::new(unsafe { File::from_raw_fd(fd) });
 
-        let entry = self.do_lookup(parent, name)?;
+        let entry = self.lookup(ctx, parent, name)?;
 
         let handle = self.next_handle.fetch_add(1, Ordering::Relaxed);
         let data = HandleData {
@@ -1590,18 +1615,6 @@ impl FileSystem for PassthroughFs {
         _flags: u32,
     ) -> io::Result<usize> {
         debug!("read: {inode:?}");
-        if inode == self.init_inode {
-            let off: usize = offset
-                .try_into()
-                .map_err(|_| io::Error::from_raw_os_error(libc::EINVAL))?;
-            let len = if off + (size as usize) < INIT_BINARY.len() {
-                size as usize
-            } else {
-                INIT_BINARY.len() - off
-            };
-            return w.write(&INIT_BINARY[off..(off + len)]);
-        }
-
         let data = self
             .handles
             .read()
@@ -1799,7 +1812,7 @@ impl FileSystem for PassthroughFs {
             // Safe because this doesn't modify any memory and we check the return value.
             let res = match ihandle {
                 InodeHandle::Fd(fd) => unsafe { libc::futimens(fd, tvs.as_ptr()) },
-                InodeHandle::Path(ref c_path) => unsafe {
+                InodeHandle::Path(c_path) => unsafe {
                     let fd = libc::open(c_path.as_ptr(), libc::O_SYMLINK | libc::O_CLOEXEC);
                     let res = libc::futimens(fd, tvs.as_ptr());
                     libc::close(fd);
@@ -1840,8 +1853,58 @@ impl FileSystem for PassthroughFs {
         let old_cpath = self.name_to_path(olddir, oldname)?;
         let new_cpath = self.name_to_path(newdir, newname)?;
 
+        // macOS addresses inodes by their volfs path ("/.vol/{dev}/{ino}"),
+        // which only resolves while the inode still has a directory entry. A
+        // rename that REPLACES an existing target drops that target's last
+        // link, so any inode the guest still holds open there would afterwards
+        // resolve to a dangling volfs path and fail path-based ops
+        // (getattr/open/setattr/...) with ENOENT (e.g. apt/dpkg's atomic
+        // rewrite of /var/lib/dpkg/status, surfaced as
+        // "close (2: No such file or directory)"). `do_unlink` already guards
+        // the unlink case by stashing an fd to the doomed inode in
+        // `InodeData.unlinked_fd`; mirror that for the overwritten target. Grab
+        // it *before* the rename, while its entry still exists. RENAME_SWAP
+        // keeps both inodes linked and RENAME_EXCL never overwrites, so skip
+        // those; best-effort otherwise (a non-overwriting rename finds nothing).
+        let doomed_fd = if (flags as i32)
+            & (bindings::LINUX_RENAME_EXCHANGE | bindings::LINUX_RENAME_NOREPLACE)
+            == 0
+        {
+            match self.inode_to_handle(newdir, true) {
+                Ok(InodeHandle::Path(newdir_cpath)) => {
+                    let newdir_fd = unsafe {
+                        libc::open(newdir_cpath.as_ptr(), libc::O_NOFOLLOW | libc::O_CLOEXEC)
+                    };
+                    if newdir_fd < 0 {
+                        None
+                    } else {
+                        let grabbed = self.grab_unlinked_fd(newdir_fd, newname).ok();
+                        unsafe { libc::close(newdir_fd) };
+                        grabbed
+                    }
+                }
+                Ok(InodeHandle::Fd(newdir_fd)) => self.grab_unlinked_fd(newdir_fd, newname).ok(),
+                Err(_) => None,
+            }
+        } else {
+            None
+        };
+
         let res = unsafe { libc::renamex_np(old_cpath.as_ptr(), new_cpath.as_ptr(), mflags) };
         if res == 0 {
+            // If the rename overwrote a tracked inode, hand its preserved fd to
+            // the inode store so later ops resolve by fd, not the vanished path.
+            // `store_unlinked_fd` takes ownership only when that inode is
+            // tracked; close the fd ourselves otherwise so it is never leaked.
+            if let Some(fd) = doomed_fd {
+                match self.store_unlinked_fd(fd) {
+                    Ok(true) => {}
+                    Ok(false) | Err(_) => unsafe {
+                        libc::close(fd);
+                    },
+                }
+            }
+
             if ((flags as i32) & bindings::LINUX_RENAME_WHITEOUT) != 0 {
                 let fd = unsafe {
                     libc::open(
@@ -1864,11 +1927,15 @@ impl FileSystem for PassthroughFs {
                 }
             }
 
-            let entry = self.do_lookup(newdir, newname)?;
+            let entry = self.lookup(ctx, newdir, newname)?;
             self.forget(ctx, entry.inode, 1);
 
             Ok(())
         } else {
+            if let Some(fd) = doomed_fd {
+                // The rename failed; nothing was overwritten. Drop the fd.
+                unsafe { libc::close(fd) };
+            }
             Err(linux_error(io::Error::last_os_error()))
         }
     }
@@ -1913,13 +1980,13 @@ impl FileSystem for PassthroughFs {
             }
 
             unsafe { libc::close(fd) };
-            self.do_lookup(parent, name)
+            self.lookup(ctx, parent, name)
         }
     }
 
     fn link(
         &self,
-        _ctx: Context,
+        ctx: Context,
         inode: Inode,
         newparent: Inode,
         newname: &CStr,
@@ -1933,7 +2000,7 @@ impl FileSystem for PassthroughFs {
         // Safe because this doesn't modify any memory and we check the return value.
         let res = unsafe { libc::link(orig_c_path.as_ptr(), link_c_path.as_ptr()) };
         if res == 0 {
-            self.do_lookup(newparent, newname)
+            self.lookup(ctx, newparent, newname)
         } else {
             Err(linux_error(io::Error::last_os_error()))
         }
@@ -1959,7 +2026,7 @@ impl FileSystem for PassthroughFs {
                 set_secctx(&ihandle, secctx, true)?
             };
 
-            let mut entry = self.do_lookup(parent, name)?;
+            let mut entry = self.lookup(ctx, parent, name)?;
             let mode = libc::S_IFLNK | 0o777;
             set_xattr_stat(&ihandle, None, Some((ctx.uid, ctx.gid)), Some(mode as u32))?;
             entry.attr.st_uid = ctx.uid;
@@ -2185,10 +2252,6 @@ impl FileSystem for PassthroughFs {
 
         if !self.cfg.xattr {
             return Err(linux_error(io::Error::from_raw_os_error(libc::ENOSYS)));
-        }
-
-        if inode == self.init_inode {
-            return Err(linux_error(io::Error::from_raw_os_error(libc::ENODATA)));
         }
 
         if name.to_bytes() == XATTR_KEY {

@@ -10,24 +10,6 @@ extern "C" {
 #include <stdbool.h>
 #include <unistd.h>
 
-/**
- * Sets the log level for the library.
- *
- * Arguments:
- *  "level" can be one of the following values:
- *    0: Off
- *    1: Error
- *    2: Warn
- *    3: Info
- *    4: Debug
- *    5: Trace
- *
- * Returns:
- *  Zero on success or a negative error number on failure.
- */
-int32_t krun_set_log_level(uint32_t level);
-
-
 #define KRUN_LOG_TARGET_DEFAULT -1
 
 #define KRUN_LOG_LEVEL_OFF 0
@@ -103,59 +85,11 @@ int32_t krun_set_vm_config(uint32_t ctx_id, uint8_t num_vcpus, uint32_t ram_mib)
  */
 #define KRUN_FS_ROOT_TAG "/dev/root"
 
-/**
- * Sets the path to be use as root for the microVM. Not available in libkrun-SEV.
- *
- * For more control over the root filesystem (e.g. read-only, DAX window size),
- * use krun_add_virtiofs3() with KRUN_FS_ROOT_TAG instead.
- *
- * Arguments:
- *  "ctx_id"    - the configuration context ID.
- *  "root_path" - a null-terminated string representing the path to be used as root.
- *
- * Returns:
- *  Zero on success or a negative error number on failure.
- */
-int32_t krun_set_root(uint32_t ctx_id, const char *root_path);
 
-/**
- * DEPRECATED. Use krun_add_disk instead.
- *
- * Sets the path to the disk image that contains the file-system to be used as root for the microVM.
- * The only supported image format is "raw".
- *
- * Arguments:
- *  "ctx_id"    - the configuration context ID.
- *  "disk_path" - a null-terminated string representing the path leading to the disk image that
- *                contains the root file-system.
- *
- * Returns:
- *  Zero on success or a negative error number on failure.
- */
-int32_t krun_set_root_disk(uint32_t ctx_id, const char *disk_path);
-
-/**
- * DEPRECATED. Use krun_add_disk instead.
- *
- * Sets the path to the disk image that contains the file-system to be used as
- * a data partition for the microVM.  The only supported image format is "raw".
- *
- * Arguments:
- *  "ctx_id"    - the configuration context ID.
- *  "disk_path" - a null-terminated string representing the path leading to the disk image that
- *                contains the root file-system.
- *
- * Returns:
- *  Zero on success or a negative error number on failure.
- */
-int32_t krun_set_data_disk(uint32_t ctx_id, const char *disk_path);
 
 /**
  * Adds a disk image to be used as a general partition for the microVM. The only supported image
  * format is "raw".
- *
- * This API is mutually exclusive with the deprecated krun_set_root_disk and
- * krun_set_data_disk methods and must not be used together.
  *
  * This function deliberately only handles images in the Raw format, because it doesn't allow
  * specifying an image format, and probing an image's format is dangerous. For more information,
@@ -182,9 +116,6 @@ int32_t krun_add_disk(uint32_t ctx_id, const char *block_id, const char *disk_pa
 /**
  * Adds a disk image to be used as a general partition for the microVM. The supported
  * image formats are: "raw" and "qcow2".
- *
- * This API is mutually exclusive with the deprecated krun_set_root_disk and
- * krun_set_data_disk methods and must not be used together.
  *
  * SECURITY NOTE:
  * Non-Raw images can reference other files, which libkrun will automatically open, and to which the
@@ -253,9 +184,6 @@ int32_t krun_add_disk2(uint32_t ctx_id,
 
 /**
  * Adds a disk image to be used as a general partition for the microVM.
- *
- * This API is mutually exclusive with the deprecated krun_set_root_disk and
- * krun_set_data_disk methods and must not be used together.
  *
  * SECURITY NOTE:
  * See the security note for `krun_add_disk2`.
@@ -395,7 +323,7 @@ int32_t krun_add_virtiofs3(uint32_t ctx_id,
 #define NET_FEATURE_HOST_TSO6 1 << 12
 #define NET_FEATURE_HOST_UFO 1 << 14
 
-/* These are the features enabled by krun_set_passt_fd and krun_set_gvproxy_path. */
+/* These are the default features used by krun_add_net_unixstream and krun_add_net_unixgram. */
 #define COMPAT_NET_FEATURES NET_FEATURE_CSUM | NET_FEATURE_GUEST_CSUM | \
                             NET_FEATURE_GUEST_TSO4 | NET_FEATURE_GUEST_UFO | \
                             NET_FEATURE_HOST_TSO4 | NET_FEATURE_HOST_UFO
@@ -517,57 +445,6 @@ int32_t krun_add_net_tap(uint32_t ctx_id,
                          uint32_t flags);
 
 /**
- * DEPRECATED. Use krun_add_net_unixstream instead.
- *
- * Configures the networking to use passt.
- * Call to this function disables TSI backend to use passt instead.
- *
- * Arguments:
- *  "ctx_id"         - the configuration context ID.
- *  "fd"             - a file descriptor to communicate with passt
- *
- * Notes:
- * If you never call this function, networking uses the TSI backend.
- * This function should be called before krun_set_port_map.
- *
- * Returns:
- *  Zero on success or a negative error number on failure.
- */
-int32_t krun_set_passt_fd(uint32_t ctx_id, int fd);
-
-/**
- * DEPRECATED. Use krun_add_net_unixgram instead.
- *
- * Configures the networking to use gvproxy in vfkit mode.
- * Call to this function disables TSI backend to use gvproxy instead.
- *
- * Arguments:
- *  "ctx_id"  - the configuration context ID.
- *  "c_path"  - a null-terminated string representing the path for
- *              gvproxy's listen-vfkit unixdgram socket.
- *
- * Notes:
- * If you never call this function, networking uses the TSI backend.
- * This function should be called before krun_set_port_map.
- *
- * Returns:
- *  Zero on success or a negative error number on failure.
- */
-int32_t krun_set_gvproxy_path(uint32_t ctx_id, char *c_path);
-
-/**
- * Sets the MAC address for the virtio-net device when using the passt backend.
- *
- * Arguments:
- *  "ctx_id"         - the configuration context ID.
- *  "mac"            - MAC address as an array of 6 uint8_t entries.
- *
- * Returns:
- *  Zero on success or a negative error number on failure.
- */
-int32_t krun_set_net_mac(uint32_t ctx_id, uint8_t *const c_mac);
-
-/**
  * Configures a map of host to guest TCP ports for the microVM.
  *
  * Arguments:
@@ -589,8 +466,9 @@ int32_t krun_set_net_mac(uint32_t ctx_id, uint8_t *const c_mac);
  *  means that for a map such as "8080:80", applications running inside the guest will also
  *  need to access the service through the "8080" port.
  *
- * If past networking mode is used (krun_set_passt_fd was called), port mapping is not supported
- * as an API of libkrun (but you can still do port mapping using command line arguments of passt)
+ * If passt networking mode is used, port mapping is not supported as an API
+ * of libkrun (but you can still do port mapping using command line arguments
+ * of passt)
  */
 int32_t krun_set_port_map(uint32_t ctx_id, const char *const port_map[]);
 
@@ -760,16 +638,121 @@ int krun_add_input_device(uint32_t ctx_id, const void *config_backend, size_t co
 int krun_add_input_device_fd(uint32_t ctx_id, int input_fd);
 
 /**
- * Enables or disables a virtio-snd device.
+ * Vhost-user device types.
+ * These correspond to virtio device type IDs for devices.
+ */
+#define KRUN_VIRTIO_DEVICE_CONSOLE 3
+#define KRUN_VIRTIO_DEVICE_RNG 4
+#define KRUN_VIRTIO_DEVICE_RTC 17
+#define KRUN_VIRTIO_DEVICE_INPUT 18
+#define KRUN_VIRTIO_DEVICE_VSOCK 19
+#define KRUN_VIRTIO_DEVICE_SND 25
+#define KRUN_VIRTIO_DEVICE_CAN 36
+
+/**
+ * Vhost-user console device default queue configuration.
+ * Console device uses 4 queues for multiport support:
+ * receiveq (idx 0), transmitq (idx 1), control receiveq (idx 2), control transmitq (idx 3).
+ */
+#define KRUN_VHOST_USER_CONSOLE_NUM_QUEUES 4
+#define KRUN_VHOST_USER_CONSOLE_QUEUE_SIZES ((uint16_t[]){128, 128, 64, 64})
+
+/**
+ * Vhost-user RNG device default queue configuration.
+ * Use these when you want explicit defaults instead of auto-detection.
+ */
+#define KRUN_VHOST_USER_RNG_NUM_QUEUES 1
+#define KRUN_VHOST_USER_RNG_QUEUE_SIZES ((uint16_t[]){256})
+
+/**
+ * Vhost-user RTC device default queue configuration.
+ * RTC device uses 2 queues: requestq (idx 0), alarmq (idx 1).
+ */
+#define KRUN_VHOST_USER_RTC_NUM_QUEUES 2
+#define KRUN_VHOST_USER_RTC_QUEUE_SIZES ((uint16_t[]){1024, 1024})
+
+/**
+ * Vhost-user input device default queue configuration.
+ * Input device uses 2 queues: eventq (idx 0), statusq (idx 1).
+ */
+#define KRUN_VHOST_USER_INPUT_NUM_QUEUES 2
+#define KRUN_VHOST_USER_INPUT_QUEUE_SIZES ((uint16_t[]){1024, 1024})
+
+/**
+ * Vhost-user sound device default queue configuration.
+ * Sound device uses 4 queues: control (idx 0), event (idx 1), TX/playback (idx 2), RX/capture (idx 3).
+ */
+#define KRUN_VHOST_USER_SND_NUM_QUEUES 4
+#define KRUN_VHOST_USER_SND_QUEUE_SIZES ((uint16_t[]){64, 64, 64, 64})
+
+/**
+ * Vhost-user vsock device default queue configuration.
+ * Vsock device uses 3 queues: RX (idx 0), TX (idx 1), event (idx 2).
+ */
+#define KRUN_VHOST_USER_VSOCK_NUM_QUEUES 3
+#define KRUN_VHOST_USER_VSOCK_QUEUE_SIZES ((uint16_t[]){128, 128, 128})
+
+/**
+ * Vhost-user CAN device default queue configuration.
+ * CAN device uses 3 queues: TX (idx 0), RX (idx 1), control (idx 2).
+ */
+#define KRUN_VHOST_USER_CAN_NUM_QUEUES 3
+#define KRUN_VHOST_USER_CAN_QUEUE_SIZES ((uint16_t[]){64, 64, 64})
+
+/**
+ * Add a vhost-user device to the VM.
+ *
+ * This function adds a vhost-user device by connecting to an external
+ * backend process (e.g., vhost-device-rng, vhost-device-snd). The backend
+ * must be running and listening on the specified socket before starting the VM.
+ *
+ * This API is designed for devices like RNG, sound, and CAN.
  *
  * Arguments:
- *  "ctx_id" - the configuration context ID.
- *  "enable" - boolean indicating whether virtio-snd should be enabled or disabled.
+ *  "ctx_id"       - the configuration context ID.
+ *  "device_type"  - type of vhost-user device (e.g., KRUN_VHOST_USER_DEVICE_RNG).
+ *  "socket_path"  - path to the vhost-user Unix domain socket (e.g., "/tmp/vhost-rng.sock").
+ *  "name"         - device name for logging/debugging (e.g., "vhost-rng", "vhost-snd").
+ *                   NULL = auto-generate from device_type ("vhost-user-4", "vhost-user-25", etc.)
+ *  "num_queues"   - number of virtqueues.
+ *                   0 = auto-detect from backend (requires backend MQ support).
+ *                   >0 = explicit queue count.
+ *                   Or use device-specific constants like KRUN_VHOST_USER_RNG_NUM_QUEUES.
+ *  "queue_sizes"  - array of queue sizes for each queue.
+ *                   NULL = use default size (256) for all queues.
+ *                   When num_queues=0 (auto-detect): array must be 0-terminated (sentinel).
+ *                   When num_queues>0 (explicit): array must have exactly num_queues elements.
+ *                   Use device-specific constants like KRUN_VHOST_USER_RNG_QUEUE_SIZES for defaults.
+ *
+ * Examples:
+ *  // Auto-detect queue count, use default size (256)
+ *  krun_add_vhost_user_device(ctx, KRUN_VHOST_USER_DEVICE_RNG, "/tmp/rng.sock", NULL, 0, NULL);
+ *
+ *  // Auto-detect queue count, use custom size (512) for all queues
+ *  uint16_t custom_size[] = {512, 0};  // 0 = sentinel terminator
+ *  krun_add_vhost_user_device(ctx, KRUN_VHOST_USER_DEVICE_RNG, "/tmp/rng.sock", NULL, 0, custom_size);
+ *
+ *  // Explicit defaults using #define constants
+ *  krun_add_vhost_user_device(ctx, KRUN_VHOST_USER_DEVICE_RNG, "/tmp/rng.sock", "vhost-rng",
+ *                             KRUN_VHOST_USER_RNG_NUM_QUEUES,
+ *                             KRUN_VHOST_USER_RNG_QUEUE_SIZES);
+ *
+ *  // Explicit queue count with custom sizes
+ *  uint16_t sizes[] = {256, 512};
+ *  krun_add_vhost_user_device(ctx, KRUN_VHOST_USER_DEVICE_SND, "/tmp/snd.sock", "vhost-snd", 2, sizes);
  *
  * Returns:
  *  Zero on success or a negative error number on failure.
+ *  -EINVAL  - Invalid parameters (device_type, socket_path, etc.)
+ *  -ENOENT  - Context doesn't exist
+ *  -ENOTSUP - vhost-user support not compiled in
  */
-int32_t krun_set_snd_device(uint32_t ctx_id, bool enable);
+int32_t krun_add_vhost_user_device(uint32_t ctx_id,
+                                   uint32_t device_type,
+                                   const char *socket_path,
+                                   const char *name,
+                                   uint16_t num_queues,
+                                   const uint16_t *queue_sizes);
 
 /**
  * Configures a map of rlimits to be set in the guest before starting the isolated binary.
@@ -800,8 +783,7 @@ int32_t krun_set_smbios_oem_strings(uint32_t ctx_id, const char *const oem_strin
  *
  * Arguments:
  *  "ctx_id"        - the configuration context ID.
- *  "workdir_path"  - the path to the working directory, relative to the root configured with
- *                    "krun_set_root".
+ *  "workdir_path"  - the path to the working directory, relative to the root filesystem.
  *
  * Returns:
  *  Zero on success or a negative error number on failure.
@@ -815,7 +797,7 @@ int32_t krun_set_workdir(uint32_t ctx_id,
  *
  * Arguments:
  *  "ctx_id"    - the configuration context ID.
- *  "exec_path" - the path to the executable, relative to the root configured with "krun_set_root".
+ *  "exec_path" - the path to the executable, relative to the root filesystem.
  *  "argv"      - an array of string pointers to be passed as arguments.
  *  "envp"      - an array of string pointers to be injected as environment variables into the
  *                context of the executable. If NULL, it will auto-generate an array collecting the
@@ -924,10 +906,6 @@ int32_t krun_add_vsock_port2(uint32_t ctx_id,
 /**
  * Add a vsock device with specified TSI features.
  *
- * By default, libkrun creates a vsock device implicitly with TSI hijacking
- * enabled based on heuristics. To use this function, you must first call
- * krun_disable_implicit_vsock() to disable the implicit vsock device.
- *
  * Currently only one vsock device is supported. Calling this function
  * multiple times will return an error.
  *
@@ -978,7 +956,7 @@ int32_t krun_set_egress_policy(uint32_t ctx_id,
 
 /**
  * Returns the eventfd file descriptor to signal the guest to shut down orderly. This must be
- * called before starting the microVM with "krun_start_event". Only available in libkrun-efi.
+ * called before starting the microVM with "krun_start_event".
  *
  * Arguments:
  *  "ctx_id"    - the configuration context ID.
@@ -987,6 +965,20 @@ int32_t krun_set_egress_policy(uint32_t ctx_id,
  *  The eventfd file descriptor or a negative error number on failure.
  */
 int32_t krun_get_shutdown_eventfd(uint32_t ctx_id);
+
+/**
+ * Configures the console device to write its output to "c_filepath".
+ * Only available when built with AWS Nitro support.
+ *
+ * Arguments:
+ *  "ctx_id"    - the configuration context ID.
+ *  "filepath"  - a null-terminated string representing the path of the file to write the
+ *                console output.
+ *
+ * Returns:
+ *  Zero on success or a negative error number on failure.
+ */
+int32_t krun_set_console_output(uint32_t ctx_id, const char *c_filepath);
 
 /**
  * Configures a Unix stream socket used to control a running microVM.
@@ -1005,22 +997,6 @@ int32_t krun_get_shutdown_eventfd(uint32_t ctx_id);
  *  -ENOENT if ctx_id is invalid.
  */
 int32_t krun_set_control_socket(uint32_t ctx_id, const char *c_socket_path);
-
-/**
- * Configures the console device to ignore stdin and write the output to "c_filepath".
- *
- * Arguments:
- *  "ctx_id"    - the configuration context ID.
- *  "filepath"  - a null-terminated string representing the path of the file to write the
- *                console output.
- *
- * Notes:
- *  This API only applies to the implicitly created console. If the implicit console is
- *  disabled via `krun_disable_implicit_console` the operation is a NOOP. Additionally,
- *  this API does not have any effect on consoles created via the `krun_add_*_console_default`
- *  APIs.
- */
-int32_t krun_set_console_output(uint32_t ctx_id, const char *c_filepath);
 
 /**
  * Configures uid which is set right before the microVM is started.
@@ -1082,14 +1058,13 @@ int32_t krun_check_nested_virt(void);
 #define KRUN_FEATURE_NET 0
 #define KRUN_FEATURE_BLK 1
 #define KRUN_FEATURE_GPU 2
-#define KRUN_FEATURE_SND 3
 #define KRUN_FEATURE_INPUT 4
-#define KRUN_FEATURE_EFI 5
 #define KRUN_FEATURE_TEE 6
 #define KRUN_FEATURE_AMD_SEV 7
 #define KRUN_FEATURE_INTEL_TDX 8
 #define KRUN_FEATURE_AWS_NITRO 9
 #define KRUN_FEATURE_VIRGL_RESOURCE_MAP2 10
+#define KRUN_FEATURE_INIT_BLOB 11
 
 /**
  * Checks if a specific feature was enabled at build time.
@@ -1127,11 +1102,12 @@ int32_t krun_get_max_vcpus(void);
 */
 int32_t krun_split_irqchip(uint32_t ctx_id, bool enable);
 
-/*
- * Do not create an implicit console device in the guest. By using this API,
- * libkrun will create zero console devices on behalf of the user. Any
- * console devices needed by the user must be added manually via other API
- * calls.
+/**
+ * Do not inject the default init binary (/init.krun) into the root
+ * filesystem. Must be called before configuring the root filesystem.
+ *
+ * No-op when libkrun is built without the "init-blob" feature (there is no
+ * implicit init to disable).
  *
  * Arguments:
  *  "ctx_id" - the configuration context ID.
@@ -1139,21 +1115,84 @@ int32_t krun_split_irqchip(uint32_t ctx_id, bool enable);
  * Returns:
  *  Zero on success or a negative error number on failure.
  */
-int32_t krun_disable_implicit_console(uint32_t ctx_id);
+int32_t krun_disable_implicit_init(uint32_t ctx_id);
 
 /**
- * Disable the implicit vsock device.
+ * Get a pointer to the built-in default init binary.
  *
- * By default, libkrun creates a vsock device automatically. This function
- * disables that behavior entirely - no vsock device will be created.
+ * This is the same binary that libkrun injects as /init.krun by default.
+ * Callers that use krun_disable_implicit_init() can use this to inject the
+ * init binary themselves (e.g. via krun_fs_add_overlay_file with custom
+ * settings).
+ *
+ * The returned pointer is valid for the lifetime of the process (static data).
  *
  * Arguments:
- *  "ctx_id" - the configuration context ID.
+ *  "data_out" - receives a pointer to the init binary bytes.
+ *  "len_out"  - receives the length in bytes.
  *
  * Returns:
  *  Zero on success or a negative error number on failure.
+ *  -EINVAL   - data_out or len_out is NULL
+ *  -ENOTSUP  - libkrun was built without the "init-blob" feature
  */
-int32_t krun_disable_implicit_vsock(uint32_t ctx_id);
+int32_t krun_get_default_init(const uint8_t **data_out, size_t *len_out);
+
+/**
+ * Add a virtual overlay file to a virtiofs device.
+ *
+ * The file is backed entirely by host memory (no host file). The data
+ * pointer is NOT copied — the caller must keep the memory valid for the
+ * full VM lifetime.
+ *
+ * "path" may contain '/' to place the file inside a virtual directory
+ * previously created with krun_fs_add_overlay_dir (e.g. "etc/hostname").
+ * All intermediate directories must already exist; -ENOENT is returned
+ * if a component is missing, -ENOTDIR if a component is not a directory.
+ *
+ * Arguments:
+ *  "ctx_id"   - the configuration context ID.
+ *  "fs_tag"   - tag of the virtiofs device (e.g. "/dev/root").
+ *  "path"     - path of the file (e.g. "init.krun" or "etc/hostname").
+ *  "data"     - pointer to the file content.
+ *  "data_len" - length of the file content in bytes.
+ *  "mode"     - file mode bits (e.g. 0100644 for a regular file).
+ *  "one_shot" - if true, the file can only be looked up once.
+ *
+ * Returns:
+ *  Zero on success or a negative error number on failure.
+ *  -EINVAL  - invalid parameters (NULL pointer, empty path component)
+ *  -ENOENT  - context, fs_tag, or intermediate path component not found
+ *  -ENOTDIR - intermediate path component is not a directory
+ */
+int32_t krun_fs_add_overlay_file(uint32_t ctx_id, const char *fs_tag,
+                                 const char *path, const uint8_t *data,
+                                 size_t data_len, uint32_t mode, bool one_shot);
+
+/**
+ * Add a virtual overlay directory to a virtiofs device.
+ *
+ * The directory is empty and read-only, useful as a mount point.
+ *
+ * "path" may contain '/' to nest inside an existing virtual directory
+ * (e.g. "usr/lib"). All intermediate directories must already exist;
+ * -ENOENT is returned if a component is missing, -ENOTDIR if a component
+ * is not a directory.
+ *
+ * Arguments:
+ *  "ctx_id"   - the configuration context ID.
+ *  "fs_tag"   - tag of the virtiofs device (e.g. "/dev/root").
+ *  "path"     - path of the directory (e.g. "dev" or "usr/lib").
+ *  "mode"     - directory mode bits (e.g. 040755).
+ *
+ * Returns:
+ *  Zero on success or a negative error number on failure.
+ *  -EINVAL  - invalid parameters (NULL pointer, empty path component)
+ *  -ENOENT  - context, fs_tag, or intermediate path component not found
+ *  -ENOTDIR - intermediate path component is not a directory
+ */
+int32_t krun_fs_add_overlay_dir(uint32_t ctx_id, const char *fs_tag,
+                                const char *path, uint32_t mode);
 
 /*
  * Specify the value of `console=` in the kernel commandline.
@@ -1172,9 +1211,7 @@ int32_t krun_set_kernel_console(uint32_t ctx_id, const char *console_id);
  *
  * The function can be called multiple times for adding multiple virtio-console devices.
  * In the guest, the consoles will appear in the same order as they are added (that is,
- * the first added console will be "hvc0", the second "hvc1", ...). However, if the
- * implicit console is not disabled via `krun_disable_implicit_console`, the first
- * console created with the function will occupy the "hvc1" ID.
+ * the first added console will be "hvc0", the second "hvc1", ...).
  *
  * This function attaches a multi port virtio-console to the guest. If the input, output and error
  * file descriptors are TTYs, the device will be created with just a single console port (`err_fd`
@@ -1184,39 +1221,55 @@ int32_t krun_set_kernel_console(uint32_t ctx_id, const char *console_id);
  * the stdin/stdout/stderr of the application in the guest appropriately.
  *
  * Arguments:
- *  "ctx_id"    - the configuration context ID.
- *  "input_fd"  - file descriptor to use as input for console.
- *  "output_fd" - file descriptor to use as output for console.
- *  "err_fd"    - file descriptor to use as err for console.
+ *  "ctx_id"       - the configuration context ID.
+ *  "input_fd"     - file descriptor to use as input for console (Unix).
+ *  "input_handle" - HANDLE to use as input for console (Windows).
+ *  "output_fd"     - file descriptor to use as output for console (Unix).
+ *  "output_handle" - HANDLE to use as output for console (Windows).
+ *  "err_fd"        - file descriptor to use as err for console (Unix).
+ *  "err_handle"    - HANDLE to use as err for console (Windows).
  *
  * Returns:
  *  Zero on success or a negative error number on failure.
  */
 int32_t krun_add_virtio_console_default(uint32_t ctx_id,
-                                      int input_fd,
-                                      int output_fd,
-                                      int err_fd);
+#ifdef _WIN32
+                                        void *input_handle,
+                                        void *output_handle,
+                                        void *err_handle
+#else
+                                        int input_fd,
+                                        int output_fd,
+                                        int err_fd
+#endif
+                                        );
 
 /*
  * Adds a legacy serial device to the guest.
  *
  * The function can be called multiple times for adding multiple serial devices.
  * In the guest, the consoles will appear in the same order as they are added (that is,
- * the first added console will be "ttyS0", the second "ttyS1", ...). However, if the
- * implicit console is not disabled via `krun_disable_implicit_console` on aarch64 or macOS,
- * the first console created with the function will occupy the "ttyS1" ID.
+ * the first added console will be "ttyS0", the second "ttyS1", ...).
  *
  * Arguments:
- *  "ctx_id"    - the configuration context ID.
- *  "input_fd"  - file descriptor to use as input for console.
- *  "output_fd" - file descriptor to use as output for console.
+ *  "ctx_id"       - the configuration context ID.
+ *  "input_fd"     - file descriptor to use as input for console (Unix).
+ *  "input_handle" - HANDLE to use as input for console (Windows).
+ *  "output_fd"     - file descriptor to use as output for console (Unix).
+ *  "output_handle" - HANDLE to use as output for console (Windows).
  *
  * Returns:
  *  Zero on success or a negative error number on failure.
  */
 int32_t krun_add_serial_console_default(uint32_t ctx_id,
-                                      int input_fd,
-                                      int output_fd);
+#ifdef _WIN32
+                                        void *input_handle,
+                                        void *output_handle
+#else
+                                        int input_fd,
+                                        int output_fd
+#endif
+                                        );
 
 /*
  * Adds a multi-port virtio-console device to the guest with explicitly configured ports.
@@ -1227,8 +1280,7 @@ int32_t krun_add_serial_console_default(uint32_t ctx_id,
  *
  * The function can be called multiple times for adding multiple virtio-console devices.
  * Each device appears in the guest with port 0 accessible as /dev/hvcN (hvc0, hvc1, etc.) in the order
- * devices are added. If the implicit console is not disabled via `krun_disable_implicit_console`,
- * the first explicitly added device will occupy the "hvc1" ID. Additional ports within each device
+ * devices are added. Additional ports within each device
  * (port 1, 2, ...) appear as /dev/vportNpM character devices.
  *
  * Arguments:
@@ -1249,15 +1301,21 @@ int32_t krun_add_virtio_console_multiport(uint32_t ctx_id);
  *  "ctx_id"     - the configuration context ID
  *  "console_id" - the console ID returned by krun_add_virtio_console_multiport()
  *  "name"       - the name of the port for identifying the port in the guest, can be empty ("")
- *  "tty_fd"     - file descriptor for the TTY to use for both input, output, and determining terminal size
+ *  "tty_fd"     - file descriptor for the TTY to use for both input, output, and determining terminal size (Unix).
+ *  "tty_handle" - HANDLE for the TTY to use for both input, output, and determining terminal size (Windows).
  *
  * Returns:
  *  Zero on success or a negative error number on failure.
  */
 int32_t krun_add_console_port_tty(uint32_t ctx_id,
-                                   uint32_t console_id,
-                                   const char *name,
-                                   int tty_fd);
+                                  uint32_t console_id,
+                                  const char *name,
+#ifdef _WIN32
+                                  void *tty_handle
+#else
+                                  int tty_fd
+#endif
+                                  );
 
 /*
  * Adds a generic I/O port to a multi-port virtio-console device, suitable for arbitrary bidirectional 
@@ -1270,17 +1328,25 @@ int32_t krun_add_console_port_tty(uint32_t ctx_id,
  *  "ctx_id"     - the configuration context ID
  *  "console_id" - the console ID returned by krun_add_virtio_console_multiport()
  *  "name"       - the name of the port for identifying the port in the guest, can be empty ("")
- *  "input_fd"   - file descriptor to use for input (host writes, guest reads)
- *  "output_fd"  - file descriptor to use for output (guest writes, host reads)
+ *  "input_fd"     - file descriptor to use for input (host writes, guest reads) (Unix).
+ *  "input_handle" - HANDLE to use for input (host writes, guest reads) (Windows).
+ *  "output_fd"     - file descriptor to use for output (guest writes, host reads) (Unix).
+ *  "output_handle" - HANDLE to use for output (guest writes, host reads) (Windows).
  *
  * Returns:
  *  Zero on success or a negative error number on failure.
  */
 int32_t krun_add_console_port_inout(uint32_t ctx_id,
-                                     uint32_t console_id,
-                                     const char *name,
-                                     int input_fd,
-                                     int output_fd);
+                                    uint32_t console_id,
+                                    const char *name,
+#ifdef _WIN32
+                                    void *input_handle,
+                                    void *output_handle
+#else
+                                    int input_fd,
+                                    int output_fd
+#endif
+                                    );
 
 /**
  * Configure block device to be used as root filesystem.

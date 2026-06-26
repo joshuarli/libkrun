@@ -9,11 +9,11 @@ use std::sync::{Arc, Mutex};
 use super::super::Queue as VirtQueue;
 use super::protocol::GpuResponse::*;
 use super::protocol::{
-    GpuResponse, GpuResponsePlaneInfo, VirtioGpuResult, VIRTIO_GPU_BLOB_FLAG_CREATE_GUEST_HANDLE,
-    VIRTIO_GPU_BLOB_MEM_HOST3D, VIRTIO_GPU_MAX_SCANOUTS,
+    GpuResponse, GpuResponsePlaneInfo, VIRTIO_GPU_BLOB_FLAG_CREATE_GUEST_HANDLE,
+    VIRTIO_GPU_BLOB_MEM_HOST3D, VIRTIO_GPU_MAX_SCANOUTS, VirtioGpuResult,
 };
 #[cfg(target_os = "macos")]
-use crossbeam_channel::{unbounded, Sender};
+use crossbeam_channel::{Sender, unbounded};
 use krun_display::{
     DisplayBackend, DisplayBackendBasicFramebuffer, DisplayBackendInstance, Rect, ResourceFormat,
 };
@@ -26,16 +26,16 @@ use rutabaga_gfx::RUTABAGA_MEM_HANDLE_TYPE_DMABUF;
 use rutabaga_gfx::RUTABAGA_MEM_HANDLE_TYPE_OPAQUE_FD;
 #[cfg(all(feature = "virgl_resource_map2", target_os = "linux"))]
 use rutabaga_gfx::RUTABAGA_MEM_HANDLE_TYPE_SHM;
-use rutabaga_gfx::{
-    ResourceCreate3D, ResourceCreateBlob, Rutabaga, RutabagaBuilder, RutabagaChannel,
-    RutabagaDescriptor, RutabagaFence, RutabagaFenceHandler, RutabagaIovec, Transfer3D,
-    RUTABAGA_CHANNEL_TYPE_WAYLAND, RUTABAGA_MAP_CACHE_MASK,
-};
 #[cfg(target_os = "linux")]
 use rutabaga_gfx::{
-    RutabagaFromRawDescriptor, RUTABAGA_CHANNEL_TYPE_PW, RUTABAGA_CHANNEL_TYPE_X11,
-    RUTABAGA_MAP_ACCESS_MASK, RUTABAGA_MAP_ACCESS_READ, RUTABAGA_MAP_ACCESS_RW,
-    RUTABAGA_MAP_ACCESS_WRITE,
+    RUTABAGA_CHANNEL_TYPE_PW, RUTABAGA_CHANNEL_TYPE_X11, RUTABAGA_MAP_ACCESS_MASK,
+    RUTABAGA_MAP_ACCESS_READ, RUTABAGA_MAP_ACCESS_RW, RUTABAGA_MAP_ACCESS_WRITE,
+    RutabagaFromRawDescriptor,
+};
+use rutabaga_gfx::{
+    RUTABAGA_CHANNEL_TYPE_WAYLAND, RUTABAGA_MAP_CACHE_MASK, ResourceCreate3D, ResourceCreateBlob,
+    Rutabaga, RutabagaBuilder, RutabagaChannel, RutabagaDescriptor, RutabagaFence,
+    RutabagaFenceHandler, RutabagaIovec, Transfer3D,
 };
 #[cfg(target_os = "macos")]
 use utils::worker_message::WorkerMessage;
@@ -389,14 +389,14 @@ impl VirtioGpu {
         }];
 
         #[cfg(target_os = "linux")]
-        if let Ok(x_display) = env::var("DISPLAY") {
-            if let Some(x_display) = x_display.strip_prefix(":") {
-                let x_path = PathBuf::from(format!("/tmp/.X11-unix/X{x_display}"));
-                rutabaga_channels.push(RutabagaChannel {
-                    base_channel: x_path,
-                    channel_type: RUTABAGA_CHANNEL_TYPE_X11,
-                });
-            }
+        if let Ok(x_display) = env::var("DISPLAY")
+            && let Some(x_display) = x_display.strip_prefix(":")
+        {
+            let x_path = PathBuf::from(format!("/tmp/.X11-unix/X{x_display}"));
+            rutabaga_channels.push(RutabagaChannel {
+                base_channel: x_path,
+                channel_type: RUTABAGA_CHANNEL_TYPE_X11,
+            });
         }
         #[cfg(target_os = "linux")]
         if let Ok(pw_sock_dir) = env::var("PIPEWIRE_RUNTIME_DIR")
@@ -540,7 +540,9 @@ impl VirtioGpu {
         ) {
             Some(rutabaga) => rutabaga,
             None => {
-                warn!("Failed to create virtio_gpu backend with the requested parameters. Falling back to safe defaults.");
+                warn!(
+                    "Failed to create virtio_gpu backend with the requested parameters. Falling back to safe defaults."
+                );
                 Self::create_fallback_rutabaga(
                     mem.clone(),
                     queue_ctl.clone(),

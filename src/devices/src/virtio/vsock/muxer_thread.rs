@@ -5,16 +5,16 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 
 use super::super::Queue as VirtQueue;
-use super::muxer::{push_packet, MuxerRx, ProxyMap};
+use super::muxer::{MuxerRx, ProxyMap, push_packet};
 use super::muxer_rxq::MuxerRxQ;
 use super::proxy::{NewProxyType, Proxy, ProxyRemoval, ProxyUpdate};
 use super::tsi_stream::TsiStreamProxy;
 
+use crate::virtio::InterruptTransport;
 use crate::virtio::vsock::defs;
 use crate::virtio::vsock::unix::{UnixAcceptorProxy, UnixProxy};
-use crate::virtio::InterruptTransport;
 use crossbeam_channel::Sender;
-use rand::{rng, rngs::ThreadRng, Rng};
+use rand::{Rng, rng, rngs::ThreadRng};
 use utils::epoll::{ControlOperation, Epoll, EpollEvent, EventSet};
 use vm_memory::GuestMemoryMmap;
 
@@ -109,8 +109,10 @@ impl MuxerThread {
         if let Some((peer_port, accept_fd, family, proxy_type)) = update.new_proxy {
             let local_port: u32 = thread_rng.random_range(1024..u32::MAX);
             let new_id: u64 = ((peer_port as u64) << 32) | (local_port as u64);
-            info!("[VSOCK_TIMING] creating new proxy: new_id={:#x} (peer_port={}, local_port={}) from acceptor id={:#x}",
-                  new_id, peer_port, local_port, id);
+            info!(
+                "[VSOCK_TIMING] creating new proxy: new_id={:#x} (peer_port={}, local_port={}) from acceptor id={:#x}",
+                new_id, peer_port, local_port, id
+            );
             let new_proxy: Box<dyn Proxy> = match proxy_type {
                 NewProxyType::Tcp => Box::new(TsiStreamProxy::new_reverse(
                     new_id,
@@ -201,7 +203,7 @@ impl MuxerThread {
         );
     }
 
-    fn work(self) {
+    fn work(mut self) {
         let work_start = std::time::Instant::now();
         info!("[VSOCK_TIMING] MuxerThread work() started");
 
@@ -213,18 +215,20 @@ impl MuxerThread {
             work_start.elapsed()
         );
 
+        let mut epoll_events = vec![EpollEvent::new(EventSet::empty(), 0); 32];
         let mut first_event = true;
         let mut event_count: u64 = 0;
         loop {
-            let mut epoll_events = vec![EpollEvent::new(EventSet::empty(), 0); 32];
             match self
                 .epoll
                 .wait(epoll_events.len(), -1, epoll_events.as_mut_slice())
             {
                 Ok(ev_cnt) => {
                     if first_event && ev_cnt > 0 {
-                        info!("[VSOCK_TIMING] MuxerThread received first epoll event(s) after {:?} since work() start",
-                              work_start.elapsed());
+                        info!(
+                            "[VSOCK_TIMING] MuxerThread received first epoll event(s) after {:?} since work() start",
+                            work_start.elapsed()
+                        );
                         first_event = false;
                     }
                     event_count += ev_cnt as u64;

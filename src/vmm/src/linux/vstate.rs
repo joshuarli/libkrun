@@ -7,7 +7,7 @@
 
 #[cfg(target_arch = "aarch64")]
 use arch::ArchMemoryInfo;
-use crossbeam_channel::{unbounded, Receiver, Sender, TryRecvError};
+use crossbeam_channel::{Receiver, Sender, TryRecvError, unbounded};
 use libc::{c_int, c_void, siginfo_t};
 use std::cell::Cell;
 use std::fmt::{Display, Formatter};
@@ -22,9 +22,9 @@ use std::os::unix::io::RawFd;
 #[cfg(target_arch = "x86_64")]
 use std::env;
 use std::result;
-use std::sync::atomic::{fence, Ordering};
 #[cfg(not(test))]
 use std::sync::Barrier;
+use std::sync::atomic::{Ordering, fence};
 use std::thread;
 #[cfg(target_arch = "x86_64")]
 use std::time::Duration;
@@ -44,25 +44,27 @@ use kbs_types::Tee;
 use crate::resources::TeeConfig;
 use crate::vmm_config::machine_config::CpuFeaturesTemplate;
 #[cfg(target_arch = "x86_64")]
-use cpuid::{c3, filter_cpuid, t2, VmSpec};
+use cpuid::{VmSpec, c3, filter_cpuid, t2};
+#[cfg(not(feature = "tee"))]
+use kvm_bindings::kvm_userspace_memory_region;
 #[cfg(target_arch = "x86_64")]
 use kvm_bindings::{
-    kvm_clock_data, kvm_debugregs, kvm_irqchip, kvm_lapic_state, kvm_mp_state, kvm_pit_state2,
-    kvm_regs, kvm_sregs, kvm_vcpu_events, kvm_xcrs, kvm_xsave, CpuId, MsrList, Msrs,
-    KVM_CLOCK_TSC_STABLE, KVM_IRQCHIP_IOAPIC, KVM_IRQCHIP_PIC_MASTER, KVM_IRQCHIP_PIC_SLAVE,
-    KVM_MAX_CPUID_ENTRIES,
+    CpuId, KVM_CLOCK_TSC_STABLE, KVM_IRQCHIP_IOAPIC, KVM_IRQCHIP_PIC_MASTER, KVM_IRQCHIP_PIC_SLAVE,
+    KVM_MAX_CPUID_ENTRIES, MsrList, Msrs, kvm_clock_data, kvm_debugregs, kvm_irqchip,
+    kvm_lapic_state, kvm_mp_state, kvm_pit_state2, kvm_regs, kvm_sregs, kvm_vcpu_events, kvm_xcrs,
+    kvm_xsave,
 };
-use kvm_bindings::{
-    kvm_create_guest_memfd, kvm_userspace_memory_region, kvm_userspace_memory_region2,
-    KVM_API_VERSION, KVM_MEM_GUEST_MEMFD, KVM_SYSTEM_EVENT_RESET, KVM_SYSTEM_EVENT_SHUTDOWN,
-};
+use kvm_bindings::{KVM_API_VERSION, KVM_SYSTEM_EVENT_RESET, KVM_SYSTEM_EVENT_SHUTDOWN};
 #[cfg(feature = "tee")]
-use kvm_bindings::{kvm_enable_cap, KVM_CAP_EXIT_HYPERCALL, KVM_MEMORY_EXIT_FLAG_PRIVATE};
-#[cfg(not(target_arch = "riscv64"))]
-use kvm_bindings::{kvm_memory_attributes, KVM_MEMORY_ATTRIBUTE_PRIVATE};
+use kvm_bindings::{KVM_CAP_EXIT_HYPERCALL, KVM_MEMORY_EXIT_FLAG_PRIVATE, kvm_enable_cap};
+#[cfg(all(feature = "tee", target_arch = "x86_64"))]
+use kvm_bindings::{
+    KVM_MEM_GUEST_MEMFD, KVM_MEMORY_ATTRIBUTE_PRIVATE, kvm_create_guest_memfd,
+    kvm_memory_attributes, kvm_userspace_memory_region2,
+};
 use kvm_ioctls::{Cap::*, *};
 use utils::eventfd::EventFd;
-use utils::signal::{register_signal_handler, sigrtmin, Killable};
+use utils::signal::{Killable, register_signal_handler, sigrtmin};
 use utils::sm::StateMachine;
 #[cfg(feature = "tee")]
 use utils::worker_message::{MemoryProperties, WorkerMessage};
@@ -670,90 +672,121 @@ impl Vm {
         None
     }
 
-    #[allow(unused_mut)]
+    // GuestMemfd is generally intended for either of two purposes:
+    // * sharing the memory with out-of-process components, and conversely,
+    // * hiding the memory completely from the VMM process (Confidential Computing).
+    //
+    // We only use it for the second use case currently, so don't even try to use it
+    // outside of TEE builds. Software-protected VMs are only available on x86_64 and
+    // are marked with strongly-worded warnings about them being for development only,
+    // as of late 2025. Also, on other architectures like aarch64, guest_memfd in
+    // general is unstable for now, so don't try to use it without a reason.
+
+    #[cfg(not(feature = "tee"))]
+    fn create_guest_physical_memory_slot(
+        &mut self,
+        host_addr: u64,
+        start: u64,
+        region: &GuestRegionMmap,
+    ) -> Result<()> {
+        let memory_region = kvm_userspace_memory_region {
+            slot: self.next_mem_slot,
+            guest_phys_addr: start,
+            memory_size: region.len(),
+            userspace_addr: host_addr,
+            flags: 0,
+        };
+
+        // Safe because we mapped the memory region and ensured regions do not overlap.
+        unsafe {
+            self.fd
+                .set_user_memory_region(memory_region)
+                .map_err(Error::SetUserMemoryRegion)?;
+        };
+
+        Ok(())
+    }
+
+    #[cfg(all(feature = "tee", target_arch = "x86_64"))]
+    fn create_guest_physical_memory_slot(
+        &mut self,
+        host_addr: u64,
+        start: u64,
+        region: &GuestRegionMmap,
+    ) -> Result<()> {
+        let end = start + region.len();
+
+        if !self.fd.check_extension(GuestMemfd) {
+            return Err(Error::KvmCap(GuestMemfd));
+        }
+
+        // GuestMemfd is only used for confidential-memory setups in TEE builds.
+        let guest_memfd = self
+            .fd
+            .create_guest_memfd(kvm_create_guest_memfd {
+                size: region.size() as u64,
+                flags: 0,
+                reserved: [0; 6],
+            })
+            .map_err(Error::CreateGuestMemfd)?;
+
+        let memory_region = kvm_userspace_memory_region2 {
+            slot: self.next_mem_slot,
+            flags: KVM_MEM_GUEST_MEMFD,
+            guest_phys_addr: start,
+            memory_size: region.len(),
+            userspace_addr: host_addr,
+            guest_memfd_offset: 0,
+            guest_memfd: guest_memfd as u32,
+            pad1: 0,
+            pad2: [0; 14],
+        };
+
+        // Safe because we mapped the memory region and ensured regions do not overlap.
+        unsafe {
+            self.fd
+                .set_user_memory_region2(memory_region)
+                .map_err(Error::SetUserMemoryRegion)?;
+        };
+
+        let attr = kvm_memory_attributes {
+            address: start,
+            size: region.len(),
+            attributes: KVM_MEMORY_ATTRIBUTE_PRIVATE as u64,
+            flags: 0,
+        };
+
+        self.fd
+            .set_memory_attributes(attr)
+            .map_err(Error::SetMemoryAttributes)?;
+
+        self.guest_memfds.push((Range { start, end }, guest_memfd));
+
+        Ok(())
+    }
+
+    #[cfg(all(feature = "tee", not(target_arch = "x86_64")))]
+    fn create_guest_physical_memory_slot(
+        &mut self,
+        _host_addr: u64,
+        _start: u64,
+        _region: &GuestRegionMmap,
+    ) -> Result<()> {
+        // TEE support should be rejected during VM setup on non-x86_64 targets.
+        // Do not silently fall back to the non-TEE path here, because that would
+        // ignore an invalid TEE configuration and create a normal VM instead.
+        Err(Error::InvalidTee)
+    }
+
     fn memory_region_set(
         &mut self,
         guest_mem: &GuestMemoryMmap,
         region: &GuestRegionMmap,
     ) -> Result<()> {
-        let host_addr = guest_mem.get_host_address(region.start_addr()).unwrap();
+        let host_addr = guest_mem.get_host_address(region.start_addr()).unwrap() as u64;
         let start = region.start_addr().raw_value();
-        let end = start + region.len();
 
-        // GuestMemfd is generally intended for either of two purposes:
-        // * sharing the memory with out-of-process components, and conversely,
-        // * hiding the memory completely from the VMM process (Confidential Computing).
-        //
-        // We only use it for the second use case currently, so don't even try to use it
-        // outside of TEE builds. Software-protected VMs are only available on x86_64 and
-        // are marked with strongly-worded warnings about them being for development only,
-        // as of late 2025. Also, on other architectures like aarch64, guest_memfd in
-        // general is unstable for now, so don't try to use it without a reason.
-
-        if cfg!(not(feature = "tee")) {
-            let memory_region = kvm_userspace_memory_region {
-                slot: self.next_mem_slot,
-                guest_phys_addr: start,
-                memory_size: region.len(),
-                userspace_addr: host_addr as u64,
-                flags: 0,
-            };
-
-            // Safe because we mapped the memory region, we made sure that the regions
-            // are not overlapping.
-            unsafe {
-                self.fd
-                    .set_user_memory_region(memory_region)
-                    .map_err(Error::SetUserMemoryRegion)?;
-            };
-        } else {
-            if !self.fd.check_extension(GuestMemfd) {
-                return Err(Error::KvmCap(GuestMemfd));
-            }
-
-            // Create a guest_memfd and set the region.
-            let guest_memfd = self
-                .fd
-                .create_guest_memfd(kvm_create_guest_memfd {
-                    size: region.size() as u64,
-                    flags: 0,
-                    reserved: [0; 6],
-                })
-                .map_err(Error::CreateGuestMemfd)?;
-
-            let memory_region = kvm_userspace_memory_region2 {
-                slot: self.next_mem_slot,
-                flags: KVM_MEM_GUEST_MEMFD,
-                guest_phys_addr: start,
-                memory_size: region.len(),
-                userspace_addr: host_addr as u64,
-                guest_memfd_offset: 0,
-                guest_memfd: guest_memfd as u32,
-                pad1: 0,
-                pad2: [0; 14],
-            };
-
-            // Safe because we mapped the memory region, we made sure that the regions
-            // are not overlapping.
-            unsafe {
-                self.fd
-                    .set_user_memory_region2(memory_region)
-                    .map_err(Error::SetUserMemoryRegion)?;
-            };
-
-            let attr = kvm_memory_attributes {
-                address: start,
-                size: region.len(),
-                attributes: KVM_MEMORY_ATTRIBUTE_PRIVATE as u64,
-                flags: 0,
-            };
-
-            self.fd
-                .set_memory_attributes(attr)
-                .map_err(Error::SetMemoryAttributes)?;
-
-            self.guest_memfds.push((Range { start, end }, guest_memfd));
-        }
+        self.create_guest_physical_memory_slot(host_addr, start, region)?;
 
         self.next_mem_slot += 1;
 
@@ -1006,11 +1039,11 @@ impl Vcpu {
         // Best-effort to clean up TLS. If the `Vcpu` was moved to another thread
         // _before_ running this, then there is nothing we can do.
         Self::TLS_VCPU_PTR.with(|cell: &VcpuCell| {
-            if let Some(vcpu_ptr) = cell.get() {
-                if std::ptr::eq(vcpu_ptr, self) {
-                    Self::TLS_VCPU_PTR.with(|cell: &VcpuCell| cell.take());
-                    return Ok(());
-                }
+            if let Some(vcpu_ptr) = cell.get()
+                && std::ptr::eq(vcpu_ptr, self)
+            {
+                Self::TLS_VCPU_PTR.with(|cell: &VcpuCell| cell.take());
+                return Ok(());
             }
             Err(Error::VcpuTlsNotPresent)
         })
@@ -1030,17 +1063,19 @@ impl Vcpu {
     where
         F: FnOnce(&mut Vcpu),
     {
-        Self::TLS_VCPU_PTR.with(|cell: &VcpuCell| {
-            if let Some(vcpu_ptr) = cell.get() {
-                // Dereferencing here is safe since `TLS_VCPU_PTR` is populated/non-empty,
-                // and it is being cleared on `Vcpu::drop` so there is no dangling pointer.
-                let vcpu_ref: &mut Vcpu = &mut *vcpu_ptr;
-                func(vcpu_ref);
-                Ok(())
-            } else {
-                Err(Error::VcpuTlsNotPresent)
-            }
-        })
+        unsafe {
+            Self::TLS_VCPU_PTR.with(|cell: &VcpuCell| {
+                if let Some(vcpu_ptr) = cell.get() {
+                    // Dereferencing here is safe since `TLS_VCPU_PTR` is populated/non-empty,
+                    // and it is being cleared on `Vcpu::drop` so there is no dangling pointer.
+                    let vcpu_ref: &mut Vcpu = &mut *vcpu_ptr;
+                    func(vcpu_ref);
+                    Ok(())
+                } else {
+                    Err(Error::VcpuTlsNotPresent)
+                }
+            })
+        }
     }
 
     /// Registers a signal handler which makes use of TLS and kvm immediate exit to
@@ -1195,6 +1230,7 @@ impl Vcpu {
         kernel_start_addr: GuestAddress,
         vcpu_config: &VcpuConfig,
         kernel_boot: bool,
+        pvh: bool,
     ) -> Result<()> {
         let cpuid_vm_spec = VmSpec::new(
             self.id,
@@ -1226,10 +1262,10 @@ impl Vcpu {
 
         if kernel_boot {
             arch::x86_64::msr::setup_msrs(&self.fd).map_err(Error::MSRSConfiguration)?;
-            arch::x86_64::regs::setup_regs(&self.fd, kernel_start_addr.raw_value(), self.id)
+            arch::x86_64::regs::setup_regs(&self.fd, kernel_start_addr.raw_value(), self.id, pvh)
                 .map_err(Error::REGSConfiguration)?;
             arch::x86_64::regs::setup_fpu(&self.fd).map_err(Error::FPUConfiguration)?;
-            arch::x86_64::regs::setup_sregs(guest_mem, &self.fd, self.id)
+            arch::x86_64::regs::setup_sregs(guest_mem, &self.fd, self.id, pvh)
                 .map_err(Error::SREGSConfiguration)?;
             arch::x86_64::interrupts::set_lint(&self.fd).map_err(Error::LocalIntConfiguration)?;
         }
@@ -1487,7 +1523,9 @@ impl Vcpu {
                         ))
                         .unwrap();
                     if !response_receiver.recv().unwrap() {
-                        error!("Unable to convert memory with properties: gpa: 0x{gpa:x} size: 0x{size:x} to_private: {private}");
+                        error!(
+                            "Unable to convert memory with properties: gpa: 0x{gpa:x} size: 0x{size:x} to_private: {private}"
+                        );
                         return Err(Error::VcpuUnhandledKvmExit);
                     }
                     Ok(VcpuEmulation::Handled)
@@ -1518,7 +1556,9 @@ impl Vcpu {
                             ))
                             .unwrap();
                         if !response_receiver.recv().unwrap() {
-                            error!("Unable to convert memory with properties: gpa: 0x{gpa:x} size: 0x{size:x} to_private: {private}");
+                            error!(
+                                "Unable to convert memory with properties: gpa: 0x{gpa:x} size: 0x{size:x} to_private: {private}"
+                            );
                             return Err(Error::VcpuUnhandledKvmExit);
                         }
                         Ok(VcpuEmulation::Handled)
@@ -2023,9 +2063,9 @@ mod tests {
 
     use super::*;
     #[cfg(target_arch = "aarch64")]
-    use crate::builder::create_guest_memory;
-    #[cfg(target_arch = "aarch64")]
     use crate::builder::Payload;
+    #[cfg(target_arch = "aarch64")]
+    use crate::builder::create_guest_memory;
     #[cfg(target_arch = "aarch64")]
     use crate::resources::VmResources;
     use devices;
@@ -2053,7 +2093,7 @@ mod tests {
         let gm = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), mem_size)]).unwrap();
         let mut vm = Vm::new(kvm.fd()).expect("Cannot create new vm");
         #[cfg(target_arch = "x86_64")]
-        let _kvmioapic = KvmIoapic::new(&vm.fd()).unwrap();
+        let _kvmioapic = KvmIoapic::new(vm.fd()).unwrap();
         assert!(vm.memory_init(&gm, kvm.max_memslots()).is_ok());
 
         let exit_evt = EventFd::new(utils::eventfd::EFD_NONBLOCK).unwrap();
@@ -2132,21 +2172,24 @@ mod tests {
             nested_enabled: false,
         };
 
-        assert!(vcpu
-            .configure_x86_64(&vm_mem, GuestAddress(0), &vcpu_config, true)
-            .is_ok());
+        assert!(
+            vcpu.configure_x86_64(&vm_mem, GuestAddress(0), &vcpu_config, true, false)
+                .is_ok()
+        );
 
         // Test configure while using the T2 template.
         vcpu_config.cpu_template = Some(CpuFeaturesTemplate::T2);
-        assert!(vcpu
-            .configure_x86_64(&vm_mem, GuestAddress(0), &vcpu_config, true)
-            .is_ok());
+        assert!(
+            vcpu.configure_x86_64(&vm_mem, GuestAddress(0), &vcpu_config, true, false)
+                .is_ok()
+        );
 
         // Test configure while using the C3 template.
         vcpu_config.cpu_template = Some(CpuFeaturesTemplate::C3);
-        assert!(vcpu
-            .configure_x86_64(&vm_mem, GuestAddress(0), &vcpu_config, true)
-            .is_ok());
+        assert!(
+            vcpu.configure_x86_64(&vm_mem, GuestAddress(0), &vcpu_config, true, false)
+                .is_ok()
+        );
     }
 
     #[cfg(target_arch = "aarch64")]
@@ -2167,9 +2210,10 @@ mod tests {
         )
         .unwrap();
 
-        assert!(vcpu
-            .configure_aarch64(vm.fd(), &arch_memory_info, GuestAddress(0))
-            .is_ok());
+        assert!(
+            vcpu.configure_aarch64(vm.fd(), &arch_memory_info, GuestAddress(0))
+                .is_ok()
+        );
 
         // Try it for when vcpu id is NOT 0.
         let mut vcpu = Vcpu::new_aarch64(
@@ -2179,9 +2223,10 @@ mod tests {
         )
         .unwrap();
 
-        assert!(vcpu
-            .configure_aarch64(vm.fd(), &arch_memory_info, GuestAddress(0))
-            .is_ok());
+        assert!(
+            vcpu.configure_aarch64(vm.fd(), &arch_memory_info, GuestAddress(0))
+                .is_ok()
+        );
     }
 
     #[test]

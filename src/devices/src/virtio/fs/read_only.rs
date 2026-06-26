@@ -8,13 +8,12 @@
 // Unoverridden methods fall back to the trait defaults (which return ENOSYS),
 // so the wrapper fails closed -- but new methods should still be explicitly
 // handled here for correct error semantics.
-
 #[cfg(target_os = "macos")]
 use crossbeam_channel::Sender;
 use std::ffi::CStr;
 use std::io;
-use std::sync::atomic::AtomicI32;
 use std::sync::Arc;
+use std::sync::atomic::AtomicI32;
 use std::time::Duration;
 
 #[cfg(target_os = "macos")]
@@ -25,34 +24,34 @@ use super::filesystem::{
     OpenOptions, SetattrValid, ZeroCopyReader, ZeroCopyWriter,
 };
 use super::fuse;
+use super::inode_alloc::InodeAllocator;
 use super::passthrough::{self, PassthroughFs};
+#[cfg(target_os = "windows")]
+use super::windows::fs_utils;
 use crate::virtio::bindings;
+use crate::virtio::linux_errno;
 
 type Inode = u64;
 type Handle = u64;
 
-fn erofs() -> io::Error {
-    io::Error::from_raw_os_error(libc::EROFS)
-}
-
-// Keep the Linux ioctl number so read-only virtio-fs can still handle
-// non-mutating control ioctls while rejecting host-side root deletion.
-const VIRTIO_IOC_REMOVE_ROOT_DIR_REQ: u32 = 0x7603;
-
 fn read_only_open_flags(flags: u32) -> io::Result<u32> {
     let f = flags as i32;
-    if f & libc::O_ACCMODE != libc::O_RDONLY {
-        return Err(erofs());
+    #[cfg(not(target_os = "windows"))]
+    let o_accmode = libc::O_ACCMODE;
+    #[cfg(target_os = "windows")]
+    let o_accmode = fs_utils::O_ACCMODE;
+    if f & o_accmode != libc::O_RDONLY {
+        return Err(linux_errno::erofs());
     }
     if f & libc::O_TRUNC != 0 {
-        return Err(erofs());
+        return Err(linux_errno::erofs());
     }
     #[cfg(target_os = "linux")]
     if f & libc::O_TMPFILE != 0 {
-        return Err(erofs());
+        return Err(linux_errno::erofs());
     }
 
-    Ok((flags & !(libc::O_ACCMODE as u32)) | (libc::O_RDONLY as u32))
+    Ok((flags & !(o_accmode as u32)) | (libc::O_RDONLY as u32))
 }
 
 pub struct PassthroughFsRo {
@@ -60,9 +59,9 @@ pub struct PassthroughFsRo {
 }
 
 impl PassthroughFsRo {
-    pub fn new(cfg: passthrough::Config) -> io::Result<Self> {
+    pub fn new(cfg: passthrough::Config, inode_alloc: Arc<InodeAllocator>) -> io::Result<Self> {
         Ok(Self {
-            inner: PassthroughFs::new(cfg)?,
+            inner: PassthroughFs::new(cfg, inode_alloc)?,
         })
     }
 
@@ -164,7 +163,11 @@ impl FileSystem for PassthroughFsRo {
 
     fn statfs(&self, ctx: Context, inode: Inode) -> io::Result<bindings::statvfs64> {
         let mut st = self.inner.statfs(ctx, inode)?;
-        st.f_flag |= libc::ST_RDONLY;
+        #[cfg(not(target_os = "windows"))]
+        let st_rdonly = libc::ST_RDONLY;
+        #[cfg(target_os = "windows")]
+        let st_rdonly = fs_utils::ST_RDONLY;
+        st.f_flag |= st_rdonly;
         Ok(st)
     }
 
@@ -189,12 +192,15 @@ impl FileSystem for PassthroughFsRo {
         flags: u32,
     ) -> io::Result<(Option<Handle>, OpenOptions)> {
         let f = flags as i32;
-        let accmode = f & libc::O_ACCMODE;
-        if accmode != libc::O_RDONLY {
-            return Err(erofs());
+        #[cfg(not(target_os = "windows"))]
+        let o_accmode = libc::O_ACCMODE;
+        #[cfg(target_os = "windows")]
+        let o_accmode = fs_utils::O_ACCMODE;
+        if f & o_accmode != libc::O_RDONLY {
+            return Err(linux_errno::erofs());
         }
         // Force O_RDONLY on the underlying call.
-        let ro_flags = (flags & !(libc::O_ACCMODE as u32)) | (libc::O_RDONLY as u32);
+        let ro_flags = (flags & !(o_accmode as u32)) | (libc::O_RDONLY as u32);
         self.inner.opendir(ctx, inode, ro_flags)
     }
 
@@ -245,8 +251,12 @@ impl FileSystem for PassthroughFsRo {
     }
 
     fn access(&self, ctx: Context, inode: Inode, mask: u32) -> io::Result<()> {
-        if mask & (libc::W_OK as u32) != 0 {
-            return Err(erofs());
+        #[cfg(not(target_os = "windows"))]
+        let w_ok = libc::W_OK;
+        #[cfg(target_os = "windows")]
+        let w_ok = fs_utils::W_OK;
+        if mask & (w_ok as u32) != 0 {
+            return Err(linux_errno::erofs());
         }
         self.inner.access(ctx, inode, mask)
     }
@@ -277,7 +287,7 @@ impl FileSystem for PassthroughFsRo {
     ) -> io::Result<()> {
         // Reject writable mappings.
         if (flags & fuse::SetupmappingFlags::WRITE.bits()) != 0 {
-            return Err(erofs());
+            return Err(linux_errno::erofs());
         }
         self.inner.setupmapping(
             ctx,
@@ -324,10 +334,6 @@ impl FileSystem for PassthroughFsRo {
         out_size: u32,
         exit_code: &Arc<AtomicI32>,
     ) -> io::Result<Vec<u8>> {
-        if cmd == VIRTIO_IOC_REMOVE_ROOT_DIR_REQ {
-            return Err(erofs());
-        }
-
         self.inner.ioctl(
             ctx, inode, handle, flags, cmd, arg, in_size, out_size, exit_code,
         )
@@ -343,7 +349,7 @@ impl FileSystem for PassthroughFsRo {
         _handle: Option<Handle>,
         _valid: SetattrValid,
     ) -> io::Result<(bindings::stat64, Duration)> {
-        Err(erofs())
+        Err(linux_errno::erofs())
     }
 
     fn symlink(
@@ -354,7 +360,7 @@ impl FileSystem for PassthroughFsRo {
         _name: &CStr,
         _extensions: Extensions,
     ) -> io::Result<Entry> {
-        Err(erofs())
+        Err(linux_errno::erofs())
     }
 
     fn mknod(
@@ -367,7 +373,7 @@ impl FileSystem for PassthroughFsRo {
         _umask: u32,
         _extensions: Extensions,
     ) -> io::Result<Entry> {
-        Err(erofs())
+        Err(linux_errno::erofs())
     }
 
     fn mkdir(
@@ -379,15 +385,15 @@ impl FileSystem for PassthroughFsRo {
         _umask: u32,
         _extensions: Extensions,
     ) -> io::Result<Entry> {
-        Err(erofs())
+        Err(linux_errno::erofs())
     }
 
     fn unlink(&self, _ctx: Context, _parent: Inode, _name: &CStr) -> io::Result<()> {
-        Err(erofs())
+        Err(linux_errno::erofs())
     }
 
     fn rmdir(&self, _ctx: Context, _parent: Inode, _name: &CStr) -> io::Result<()> {
-        Err(erofs())
+        Err(linux_errno::erofs())
     }
 
     fn rename(
@@ -399,7 +405,7 @@ impl FileSystem for PassthroughFsRo {
         _newname: &CStr,
         _flags: u32,
     ) -> io::Result<()> {
-        Err(erofs())
+        Err(linux_errno::erofs())
     }
 
     fn link(
@@ -409,7 +415,7 @@ impl FileSystem for PassthroughFsRo {
         _newparent: Inode,
         _newname: &CStr,
     ) -> io::Result<Entry> {
-        Err(erofs())
+        Err(linux_errno::erofs())
     }
 
     fn create(
@@ -423,7 +429,7 @@ impl FileSystem for PassthroughFsRo {
         _umask: u32,
         _extensions: Extensions,
     ) -> io::Result<(Entry, Option<Handle>, OpenOptions)> {
-        Err(erofs())
+        Err(linux_errno::erofs())
     }
 
     fn write<R: io::Read + ZeroCopyReader>(
@@ -439,7 +445,7 @@ impl FileSystem for PassthroughFsRo {
         _kill_priv: bool,
         _flags: u32,
     ) -> io::Result<usize> {
-        Err(erofs())
+        Err(linux_errno::erofs())
     }
 
     fn fallocate(
@@ -451,7 +457,7 @@ impl FileSystem for PassthroughFsRo {
         _offset: u64,
         _length: u64,
     ) -> io::Result<()> {
-        Err(erofs())
+        Err(linux_errno::erofs())
     }
 
     fn setxattr(
@@ -462,11 +468,11 @@ impl FileSystem for PassthroughFsRo {
         _value: &[u8],
         _flags: u32,
     ) -> io::Result<()> {
-        Err(erofs())
+        Err(linux_errno::erofs())
     }
 
     fn removexattr(&self, _ctx: Context, _inode: Inode, _name: &CStr) -> io::Result<()> {
-        Err(erofs())
+        Err(linux_errno::erofs())
     }
 
     fn copyfilerange(
@@ -481,20 +487,27 @@ impl FileSystem for PassthroughFsRo {
         _len: u64,
         _flags: u64,
     ) -> io::Result<usize> {
-        Err(erofs())
+        Err(linux_errno::erofs())
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use super::linux_errno;
     use super::read_only_open_flags;
+    #[cfg(target_os = "windows")]
+    use super::windows::fs_utils;
 
     #[test]
     fn read_only_open_flags_allow_append() {
         let flags = (libc::O_RDONLY | libc::O_APPEND) as u32;
         let ro_flags = read_only_open_flags(flags).unwrap();
 
-        assert_eq!((ro_flags as i32) & libc::O_ACCMODE, libc::O_RDONLY);
+        #[cfg(not(target_os = "windows"))]
+        let o_accmode = libc::O_ACCMODE;
+        #[cfg(target_os = "windows")]
+        let o_accmode = fs_utils::O_ACCMODE;
+        assert_eq!((ro_flags as i32) & o_accmode, libc::O_RDONLY);
         assert_ne!((ro_flags as i32) & libc::O_APPEND, 0);
     }
 
@@ -502,13 +515,13 @@ mod tests {
     fn read_only_open_flags_reject_write_access() {
         let err = read_only_open_flags(libc::O_WRONLY as u32).unwrap_err();
 
-        assert_eq!(err.raw_os_error(), Some(libc::EROFS));
+        assert_eq!(err.raw_os_error(), linux_errno::erofs().raw_os_error());
     }
 
     #[test]
     fn read_only_open_flags_reject_truncate() {
         let err = read_only_open_flags((libc::O_RDONLY | libc::O_TRUNC) as u32).unwrap_err();
 
-        assert_eq!(err.raw_os_error(), Some(libc::EROFS));
+        assert_eq!(err.raw_os_error(), linux_errno::erofs().raw_os_error());
     }
 }

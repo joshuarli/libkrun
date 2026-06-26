@@ -98,6 +98,7 @@ pub enum Error {
     /// Polly error wrapper.
     EventManager(event_manager::Error),
     /// I8042 Error.
+    #[cfg(target_arch = "x86_64")]
     I8042Error(devices::legacy::I8042DeviceError),
     /// Cannot access kernel file.
     KernelFile(io::Error),
@@ -152,6 +153,7 @@ impl Display for Error {
             CreateLegacyDevice(e) => write!(f, "Error creating legacy device: {e:?}"),
             EventFd(e) => write!(f, "Event fd error: {e}"),
             EventManager(e) => write!(f, "Event manager error: {e:?}"),
+            #[cfg(target_arch = "x86_64")]
             I8042Error(e) => write!(f, "I8042 error: {e}"),
             KernelFile(e) => write!(f, "Cannot access kernel file: {e}"),
             KvmContext(e) => write!(f, "Failed to validate KVM support: {e:?}"),
@@ -321,7 +323,7 @@ impl Vmm {
                 Ok(response)
                     if std::mem::discriminant(&response) == std::mem::discriminant(&expected) =>
                 {
-                    return Ok(())
+                    return Ok(());
                 }
                 Ok(VcpuResponse::Exited(_)) => return Err(Error::VcpuPause),
                 Ok(_) => {}
@@ -566,13 +568,13 @@ impl Vmm {
                 Ok(VcpuResponse::Exited(_)) => {
                     return Err(Error::VcpuSnapshot(
                         "vCPU exited during capture".to_string(),
-                    ))
+                    ));
                 }
                 Ok(_) => {}
                 Err(_) => {
                     return Err(Error::VcpuSnapshot(
                         "channel closed while capturing vCPU state".to_string(),
-                    ))
+                    ));
                 }
             }
         }
@@ -855,6 +857,7 @@ impl Vmm {
         _intc: &IrqChip,
         initrd: &Option<InitrdConfig>,
         _smbios_oem_strings: &Option<Vec<String>>,
+        _pvh: bool,
     ) -> Result<()> {
         #[cfg(target_arch = "x86_64")]
         {
@@ -871,6 +874,7 @@ impl Vmm {
                 cmdline_len,
                 initrd,
                 vcpus.len() as u8,
+                _pvh,
             )
             .map_err(Error::ConfigureSystem)?;
         }

@@ -19,27 +19,36 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
 use imago::{
-    file::File as ImagoFile, qcow2::Qcow2, raw::Raw, vmdk::Vmdk, DynStorage, FormatCreateBuilder,
-    FormatDriverBuilder, PermissiveImplicitOpenGate, Storage, StorageCreateOptions,
-    StorageOpenOptions, SyncFormatAccess,
+    DynStorage, FormatCreateBuilder, FormatDriverBuilder, PermissiveImplicitOpenGate, Storage,
+    StorageCreateOptions, StorageOpenOptions, SyncFormatAccess, file::File as ImagoFile,
+    qcow2::Qcow2, raw::Raw, vmdk::Vmdk,
 };
 use log::{error, warn};
-use utils::eventfd::{EventFd, EFD_NONBLOCK};
+use utils::eventfd::{EFD_NONBLOCK, EventFd};
 use virtio_bindings::{
     virtio_blk::*, virtio_config::VIRTIO_F_VERSION_1, virtio_ring::VIRTIO_RING_F_EVENT_IDX,
 };
 use vm_memory::{ByteValued, GuestMemoryMmap};
 
+#[cfg(target_os = "windows")]
+use std::mem::MaybeUninit;
+#[cfg(target_os = "windows")]
+use std::os::windows::io::AsRawHandle;
+#[cfg(target_os = "windows")]
+use windows_sys::Win32::Storage::FileSystem::{
+    BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
+};
+
 use super::worker::BlockWorker;
 use super::{
-    super::{ActivateResult, DeviceQueue, DeviceState, QueueConfig, VirtioDevice, TYPE_BLOCK},
+    super::{ActivateResult, DeviceQueue, DeviceState, QueueConfig, TYPE_BLOCK, VirtioDevice},
     Error, NUM_QUEUES, QUEUE_CONFIG, SECTOR_SHIFT, SECTOR_SIZE,
 };
 
 use crate::virtio::{
+    ActivateError, InterruptTransport,
     block::{ImageType, SyncMode},
     queue::QueueState,
-    ActivateError, InterruptTransport,
 };
 
 /// Configuration options for disk caching.
@@ -109,14 +118,32 @@ impl DiskProperties {
     }
 
     fn build_device_id(disk_file: &File) -> result::Result<String, Error> {
-        let blk_metadata = disk_file.metadata().map_err(Error::GetFileMetadata)?;
         // This is how kvmtool does it.
-        let device_id = format!(
-            "{}{}{}",
-            blk_metadata.st_dev(),
-            blk_metadata.st_rdev(),
-            blk_metadata.st_ino()
-        );
+        #[cfg(unix)]
+        let device_id = {
+            let blk_metadata = disk_file.metadata().map_err(Error::GetFileMetadata)?;
+            format!(
+                "{}{}{}",
+                blk_metadata.st_dev(),
+                blk_metadata.st_rdev(),
+                blk_metadata.st_ino()
+            )
+        };
+        #[cfg(target_os = "windows")]
+        let device_id = {
+            let mut info = MaybeUninit::<BY_HANDLE_FILE_INFORMATION>::zeroed();
+            let ret =
+                unsafe { GetFileInformationByHandle(disk_file.as_raw_handle(), info.as_mut_ptr()) };
+            if ret != 0 {
+                let info = unsafe { info.assume_init() };
+                format!(
+                    "{}{}{}",
+                    info.dwVolumeSerialNumber, info.nFileIndexHigh, info.nFileIndexLow
+                )
+            } else {
+                return Err(Error::GetFileMetadata(io::Error::last_os_error()));
+            }
+        };
         Ok(device_id)
     }
 

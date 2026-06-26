@@ -4,26 +4,34 @@ use crossbeam_channel::Sender;
 use utils::worker_message::WorkerMessage;
 
 use std::io;
+#[cfg(unix)]
 use std::os::fd::AsRawFd;
-use std::sync::atomic::AtomicI32;
 use std::sync::Arc;
+use std::sync::atomic::AtomicI32;
 use std::thread;
+#[cfg(windows)]
+use utils::windows::AsRawFd;
 
 use utils::epoll::{ControlOperation, Epoll, EpollEvent, EventSet};
 use utils::eventfd::EventFd;
 use vm_memory::GuestMemoryMmap;
 
 use super::super::{FsError, FuseServerState, Queue};
+use super::augment_fs::AugmentFs;
 use super::defs::{HPQ_INDEX, REQ_INDEX};
 use super::descriptor_utils::{Reader, Writer};
+use super::inode_alloc::InodeAllocator;
+use super::null_fs::NullFs;
 use super::passthrough::{self, PassthroughFs};
 use super::read_only::PassthroughFsRo;
 use super::server::Server;
+use super::virtual_entry::VirtualDirEntry;
 use crate::virtio::{InterruptTransport, VirtioShmRegion};
 
 enum FsServer {
-    ReadWrite(Server<PassthroughFs>),
-    ReadOnly(Server<PassthroughFsRo>),
+    ReadWrite(Server<AugmentFs<PassthroughFs>>),
+    ReadOnly(Server<AugmentFs<PassthroughFsRo>>),
+    Null(Server<AugmentFs<NullFs>>),
 }
 
 impl FsServer {
@@ -45,6 +53,14 @@ impl FsServer {
                 map_sender,
             ),
             FsServer::ReadOnly(s) => s.handle_message(
+                r,
+                w,
+                shm_region,
+                exit_code,
+                #[cfg(target_os = "macos")]
+                map_sender,
+            ),
+            FsServer::Null(s) => s.handle_message(
                 r,
                 w,
                 shm_region,
@@ -77,25 +93,43 @@ impl FsWorker {
         interrupt: InterruptTransport,
         mem: GuestMemoryMmap,
         shm_region: Option<VirtioShmRegion>,
-        passthrough_cfg: passthrough::Config,
+        passthrough_cfg: Option<passthrough::Config>,
         read_only: bool,
+        virtual_entries: Vec<VirtualDirEntry>,
         stop_fd: EventFd,
         exit_code: Arc<AtomicI32>,
         restore_fuse: Option<FuseServerState>,
         #[cfg(target_os = "macos")] map_sender: Option<Sender<WorkerMessage>>,
     ) -> Result<Self, io::Error> {
-        let server = if read_only {
-            let fs = PassthroughFsRo::new(passthrough_cfg)?;
-            if let Some(state) = restore_fuse.as_ref() {
-                fs.inner().restore(state)?;
+        let inode_alloc = Arc::new(InodeAllocator::new());
+        let server = match passthrough_cfg {
+            Some(cfg) if read_only => {
+                let inner = PassthroughFsRo::new(cfg, inode_alloc.clone())?;
+                if let Some(state) = restore_fuse.as_ref() {
+                    inner.inner().restore(state)?;
+                }
+                FsServer::ReadOnly(Server::new(AugmentFs::new(
+                    inner,
+                    &inode_alloc,
+                    virtual_entries,
+                )))
             }
-            FsServer::ReadOnly(Server::new(fs))
-        } else {
-            let fs = PassthroughFs::new(passthrough_cfg)?;
-            if let Some(state) = restore_fuse.as_ref() {
-                fs.restore(state)?;
+            Some(cfg) => {
+                let inner = PassthroughFs::new(cfg, inode_alloc.clone())?;
+                if let Some(state) = restore_fuse.as_ref() {
+                    inner.restore(state)?;
+                }
+                FsServer::ReadWrite(Server::new(AugmentFs::new(
+                    inner,
+                    &inode_alloc,
+                    virtual_entries,
+                )))
             }
-            FsServer::ReadWrite(Server::new(fs))
+            None => FsServer::Null(Server::new(AugmentFs::new(
+                NullFs,
+                &inode_alloc,
+                virtual_entries,
+            ))),
         };
         Ok(Self {
             queues,
@@ -128,8 +162,9 @@ impl FsWorker {
     /// host paths) for checkpoint/fork. Call only while the worker is stopped.
     pub(crate) fn save_fuse_state(&self) -> Option<FuseServerState> {
         match &self.server {
-            FsServer::ReadWrite(s) => Some(s.fs().snapshot()),
-            FsServer::ReadOnly(s) => Some(s.fs().inner().snapshot()),
+            FsServer::ReadWrite(s) => Some(s.fs().inner().snapshot()),
+            FsServer::ReadOnly(s) => Some(s.fs().inner().inner().snapshot()),
+            FsServer::Null(_) => None,
         }
     }
 
@@ -138,7 +173,7 @@ impl FsWorker {
         let virtq_req_ev_fd = self.queue_evts[REQ_INDEX].as_raw_fd();
         let stop_ev_fd = self.stop_fd.as_raw_fd();
 
-        let epoll = Epoll::new().unwrap();
+        let mut epoll = Epoll::new().unwrap();
 
         let _ = epoll.ctl(
             ControlOperation::Add,
@@ -156,8 +191,8 @@ impl FsWorker {
             &EpollEvent::new(EventSet::IN, stop_ev_fd as u64),
         );
 
+        let mut epoll_events = vec![EpollEvent::new(EventSet::empty(), 0); 32];
         loop {
-            let mut epoll_events = vec![EpollEvent::new(EventSet::empty(), 0); 32];
             match epoll.wait(epoll_events.len(), -1, epoll_events.as_mut_slice()) {
                 Ok(ev_cnt) => {
                     for event in &epoll_events[0..ev_cnt] {
@@ -223,7 +258,7 @@ impl FsWorker {
                 .map_err(FsError::QueueWriter)
                 .unwrap();
 
-            if let Err(e) = self.server.handle_message(
+            let len = match self.server.handle_message(
                 reader,
                 writer,
                 &self.shm_region,
@@ -231,10 +266,14 @@ impl FsWorker {
                 #[cfg(target_os = "macos")]
                 &self.map_sender,
             ) {
-                error!("error handling message: {e:?}");
-            }
+                Ok(len) => len,
+                Err(e) => {
+                    error!("error handling message: {e:?}");
+                    0
+                }
+            };
 
-            if let Err(e) = queue.add_used(&self.mem, head.index, 0) {
+            if let Err(e) = queue.add_used(&self.mem, head.index, len as u32) {
                 error!("failed to add used elements to the queue: {e:?}");
             }
 

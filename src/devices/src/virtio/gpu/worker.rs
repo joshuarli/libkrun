@@ -5,7 +5,7 @@ use std::os::fd::{AsRawFd, BorrowedFd};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
-use nix::fcntl::{fcntl, FcntlArg, OFlag};
+use nix::fcntl::{FcntlArg, OFlag, fcntl};
 use utils::eventfd::EventFd;
 
 #[cfg(target_os = "macos")]
@@ -13,8 +13,8 @@ use crossbeam_channel::Sender;
 #[cfg(target_os = "linux")]
 use rutabaga_gfx::AsRawDescriptor;
 use rutabaga_gfx::{
-    ResourceCreate3D, ResourceCreateBlob, RutabagaFence, Transfer3D,
-    RUTABAGA_PIPE_BIND_RENDER_TARGET, RUTABAGA_PIPE_TEXTURE_2D,
+    RUTABAGA_PIPE_BIND_RENDER_TARGET, RUTABAGA_PIPE_TEXTURE_2D, ResourceCreate3D,
+    ResourceCreateBlob, RutabagaFence, Transfer3D,
 };
 #[cfg(target_os = "macos")]
 use utils::worker_message::WorkerMessage;
@@ -23,7 +23,7 @@ use vm_memory::{GuestAddress, GuestMemoryMmap};
 use super::super::descriptor_utils::{Reader, Writer};
 use super::super::{DeviceQueue, GpuError, Queue as VirtQueue};
 use super::protocol::{
-    virtio_gpu_ctrl_hdr, virtio_gpu_mem_entry, GpuCommand, GpuResponse, VirtioGpuResult,
+    GpuCommand, GpuResponse, VirtioGpuResult, virtio_gpu_ctrl_hdr, virtio_gpu_mem_entry,
 };
 use super::virtio_gpu::VirtioGpu;
 use crate::virtio::display::DisplayInfo;
@@ -217,15 +217,11 @@ impl Worker {
             }
 
             let mut process_queue = false;
-            // Index loop is intentional: reading `.u64` from the packed
-            // `epoll_event` via place indexing avoids the misaligned reference
-            // to a packed field (E0793) that iterating by reference would take.
-            #[allow(clippy::needless_range_loop)]
-            for i in 0..n as usize {
+            for event in events.iter().take(n as usize) {
                 // Copy the token out of the packed epoll_event field before
                 // matching: a guard like `t if t >= K` on a packed field would
                 // create a misaligned reference (E0793).
-                let token = events[i].u64;
+                let token = event.u64;
                 match token {
                     TOKEN_CONTROL => {
                         if let Err(e) = self.control_evt.read() {
@@ -247,10 +243,10 @@ impl Worker {
             }
 
             if process_queue {
-                if self.process_queue(virtio_gpu, &self.control_queue.clone()) {
-                    if let Err(e) = self.interrupt.try_signal_used_queue() {
-                        error!("Error signaling queue: {e:?}");
-                    }
+                if self.process_queue(virtio_gpu, &self.control_queue.clone())
+                    && let Err(e) = self.interrupt.try_signal_used_queue()
+                {
+                    error!("Error signaling queue: {e:?}");
                 }
 
                 // Register per-context poll fds for newly created contexts.
@@ -296,10 +292,10 @@ impl Worker {
                 error!("Failed to read control_evt: {e:?}");
                 continue;
             }
-            if self.process_queue(virtio_gpu, &self.control_queue.clone()) {
-                if let Err(e) = self.interrupt.try_signal_used_queue() {
-                    error!("Error signaling queue: {e:?}");
-                }
+            if self.process_queue(virtio_gpu, &self.control_queue.clone())
+                && let Err(e) = self.interrupt.try_signal_used_queue()
+            {
+                error!("Error signaling queue: {e:?}");
             }
         }
     }
@@ -413,17 +409,17 @@ impl Worker {
                 // virglrenderer owns the poll fd and closes it on context destroy.
                 // Calling epoll_ctl(DEL) after destroy would use a stale or reused fd.
                 #[cfg(target_os = "linux")]
-                if let Some(Some(fd)) = self.context_poll_fds.remove(&hdr.ctx_id) {
-                    if self.epoll_fd >= 0 {
-                        unsafe {
-                            libc::epoll_ctl(
-                                self.epoll_fd,
-                                libc::EPOLL_CTL_DEL,
-                                fd,
-                                std::ptr::null_mut(),
-                            )
-                        };
-                    }
+                if let Some(Some(fd)) = self.context_poll_fds.remove(&hdr.ctx_id)
+                    && self.epoll_fd >= 0
+                {
+                    unsafe {
+                        libc::epoll_ctl(
+                            self.epoll_fd,
+                            libc::EPOLL_CTL_DEL,
+                            fd,
+                            std::ptr::null_mut(),
+                        )
+                    };
                 }
                 virtio_gpu.destroy_context(hdr.ctx_id)
             }

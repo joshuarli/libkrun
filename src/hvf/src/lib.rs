@@ -23,10 +23,10 @@ use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
 #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
-use arch::aarch64::sysreg::{sys_reg_name, SYSREG_MASK};
+use arch::aarch64::sysreg::{SYSREG_MASK, sys_reg_name};
 use log::debug;
 
-extern "C" {
+unsafe extern "C" {
     pub fn mach_absolute_time() -> u64;
 }
 
@@ -128,7 +128,7 @@ impl Display for Error {
 
         match self {
             EnableEL2 => write!(f, "Error enabling EL2 mode in HVF"),
-            FindSymbol(ref err) => write!(f, "Couldn't find symbol in HVF library: {err}"),
+            FindSymbol(err) => write!(f, "Couldn't find symbol in HVF library: {err}"),
             MemoryMap => write!(f, "Error registering memory region in HVF"),
             MemoryUnmap => write!(f, "Error unregistering memory region in HVF"),
             NestedCheck => write!(
@@ -209,6 +209,7 @@ pub fn vcpu_set_vtimer_mask(vcpuid: u64, masked: bool) -> Result<(), Error> {
     }
 }
 
+#[cfg(target_os = "macos")]
 pub fn vcpu_adjust_vtimer_offset(vcpuid: u64, delta_ns: u64) -> Result<(), Error> {
     if delta_ns == 0 {
         return Ok(());
@@ -1087,21 +1088,21 @@ impl HvfVcpu<'_> {
     pub fn run(&mut self, vcpu_list: Arc<dyn Vcpus>) -> Result<VcpuExit<'_>, Error> {
         let pending_irq = vcpu_list.has_pending_irq(self.vcpuid);
 
-        if let Some(mmio_read) = self.pending_mmio_read.take() {
-            if mmio_read.srt < 31 {
-                let val = match mmio_read.len {
-                    1 => u8::from_le_bytes(self.mmio_buf[0..1].try_into().unwrap()) as u64,
-                    2 => u16::from_le_bytes(self.mmio_buf[0..2].try_into().unwrap()) as u64,
-                    4 => u32::from_le_bytes(self.mmio_buf[0..4].try_into().unwrap()) as u64,
-                    8 => u64::from_le_bytes(self.mmio_buf[0..8].try_into().unwrap()),
-                    _ => panic!(
-                        "unsupported mmio pa={} len={}",
-                        mmio_read.addr, mmio_read.len
-                    ),
-                };
+        if let Some(mmio_read) = self.pending_mmio_read.take()
+            && mmio_read.srt < 31
+        {
+            let val = match mmio_read.len {
+                1 => u8::from_le_bytes(self.mmio_buf[0..1].try_into().unwrap()) as u64,
+                2 => u16::from_le_bytes(self.mmio_buf[0..2].try_into().unwrap()) as u64,
+                4 => u32::from_le_bytes(self.mmio_buf[0..4].try_into().unwrap()) as u64,
+                8 => u64::from_le_bytes(self.mmio_buf[0..8].try_into().unwrap()),
+                _ => panic!(
+                    "unsupported mmio pa={} len={}",
+                    mmio_read.addr, mmio_read.len
+                ),
+            };
 
-                self.write_reg(mmio_read.srt, val)?;
-            }
+            self.write_reg(mmio_read.srt, val)?;
         }
 
         if self.pending_advance_pc {

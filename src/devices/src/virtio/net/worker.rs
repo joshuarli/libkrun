@@ -6,9 +6,9 @@ use crate::virtio::net::unixstream::Unixstream;
 use crate::virtio::net::{MAX_BUFFER_SIZE, QUEUE_SIZE};
 use crate::virtio::{DeviceQueue, InterruptTransport};
 
+use super::VNET_HDR_LEN;
 use super::backend::{NetBackend, ReadError, WriteError};
 use super::device::{FrontendError, RxError, TxError, VirtioNetBackend};
-use super::VNET_HDR_LEN;
 
 #[cfg(target_os = "macos")]
 use std::os::fd::RawFd;
@@ -137,7 +137,7 @@ impl NetWorker {
         let backend_socket = self.backend.raw_socket_fd();
         let stop_ev_fd = self.stop_fd.as_raw_fd();
 
-        let epoll = Epoll::new().unwrap();
+        let mut epoll = Epoll::new().unwrap();
 
         let _ = epoll.ctl(
             ControlOperation::Add,
@@ -163,8 +163,8 @@ impl NetWorker {
             ),
         );
 
+        let mut epoll_events = vec![EpollEvent::new(EventSet::empty(), 0); 32];
         loop {
-            let mut epoll_events = vec![EpollEvent::new(EventSet::empty(), 0); 32];
             match epoll.wait(epoll_events.len(), -1, epoll_events.as_mut_slice()) {
                 Ok(ev_cnt) => {
                     for event in &epoll_events[0..ev_cnt] {
@@ -186,8 +186,12 @@ impl NetWorker {
                                 if event_set.contains(EventSet::HANG_UP)
                                     || event_set.contains(EventSet::READ_HANG_UP)
                                 {
-                                    log::error!("Got {event_set:?} on backend fd, virtio-net will stop working");
-                                    eprintln!("LIBKRUN VIRTIO-NET FATAL: Backend process seems to have quit or crashed! Networking is now disabled!");
+                                    log::error!(
+                                        "Got {event_set:?} on backend fd, virtio-net will stop working"
+                                    );
+                                    eprintln!(
+                                        "LIBKRUN VIRTIO-NET FATAL: Backend process seems to have quit or crashed! Networking is now disabled!"
+                                    );
                                 } else {
                                     if event_set.contains(EventSet::IN) {
                                         self.process_backend_socket_readable()
@@ -426,7 +430,7 @@ impl NetWorker {
                     break;
                 }
                 Err(e @ WriteError::Internal(_) | e @ WriteError::ProcessNotRunning) => {
-                    return Err(TxError::Backend(e))
+                    return Err(TxError::Backend(e));
                 }
             }
         }

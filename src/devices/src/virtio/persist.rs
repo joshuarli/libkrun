@@ -12,12 +12,12 @@
 //! fs, gpu, snd, input) are simply skipped.
 
 #[cfg(feature = "blk")]
-use crate::virtio::{block::BlockState, Block};
-#[cfg(feature = "net")]
-use crate::virtio::{net::NetState, Net};
+use crate::virtio::{Block, block::BlockState};
 use crate::virtio::{Console, ConsoleState, VirtioDevice, Vsock, VsockState};
 #[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
 use crate::virtio::{Fs, FsState};
+#[cfg(feature = "net")]
+use crate::virtio::{Net, net::NetState};
 #[cfg(not(feature = "tee"))]
 use crate::virtio::{Rng, RngState};
 

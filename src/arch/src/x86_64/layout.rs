@@ -31,6 +31,21 @@ pub const IRQ_MAX: u32 = 15;
 /// Address for the TSS setup.
 pub const KVM_TSS_ADDRESS: u64 = 0xfffb_d000;
 
+/// Address of the hvm_start_info struct used in PVH boot.
+/// Mutually exclusive with SNP_CPUID_START (TEE only).
+pub const PVH_INFO_START: u64 = 0x6000;
+
+/// Starting address of array of modules of hvm_modlist_entry type.
+/// Used to enable initrd support using the PVH boot ABI.
+pub const MODLIST_START: u64 = 0x6040;
+
+/// Address of memory map table used in PVH boot. Can overlap
+/// with the zero page address since they are mutually exclusive.
+pub const MEMMAP_START: u64 = 0x7000;
+
+/// Location of RSDP pointer in x86 machines.
+pub const RSDP_ADDR: u64 = 0x000e_0000;
+
 /// The 'zero page', a.k.a linux kernel bootparams.
 pub const ZERO_PAGE_START: u64 = 0x7000;
 
@@ -53,6 +68,12 @@ pub const RESET_VECTOR: u64 = 0xfff0;
 #[cfg(feature = "tdx")]
 pub const RESET_VECTOR: u64 = 0xffff_fff0;
 pub const RESET_VECTOR_SEV_AP: u64 = 0xfff3;
+
+/// Address of the AP idle trampoline (`cli; hlt; jmp` loop) used during
+/// SMP boot on WHP. APs park here in real mode until the BSP sends
+/// INIT + SIPI through the emulated local APIC.
+#[cfg(target_os = "windows")]
+pub const AP_TRAMPOLINE_START: u64 = 0x1000;
 
 /// The address to load the firmware, if present.
 pub const FIRMWARE_START: u64 = 0xffff_0000;
