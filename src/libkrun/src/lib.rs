@@ -440,6 +440,15 @@ fn with_cfg(ctx_id: u32, f: impl FnOnce(&mut ContextConfig) -> i32) -> i32 {
 static CTX_MAP: Lazy<Mutex<HashMap<u32, ContextConfig>>> = Lazy::new(|| Mutex::new(HashMap::new()));
 static CTX_IDS: AtomicI32 = AtomicI32::new(0);
 
+/// One guest RAM region as `(gpa_start, host_va, len)`.
+type GuestRamRegion = (u64, u64, u64);
+
+/// Guest RAM regions per running context, published by `krun_start_enter` once
+/// the VM's memory exists. Read by `krun_get_guest_ram` so an in-process
+/// embedder can access guest memory for zero-copy transfers.
+static GUEST_RAM: Lazy<Mutex<HashMap<u32, Vec<GuestRamRegion>>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
+
 /// An in-process VM checkpoint kept resident in the libkrun process: the
 /// captured VM/vCPU/device state plus the guest-memory image. Used by the
 /// control-socket CHECKPOINT/RESTORE commands to rewind a running VM without
@@ -3657,6 +3666,15 @@ pub extern "C" fn krun_start_enter(ctx_id: u32) -> i32 {
     };
     lk_timing!("build_microvm done");
 
+    // Publish the guest-RAM host mapping so an in-process embedder (e.g. a CUDA
+    // forwarding server on another thread) can read guest memory directly for
+    // zero-copy transfers. Best-effort; a failure just leaves callers on the
+    // byte-shipping path.
+    let ram_regions = _vmm.lock().unwrap().guest_ram_regions();
+    if !ram_regions.is_empty() {
+        GUEST_RAM.lock().unwrap().insert(ctx_id, ram_regions);
+    }
+
     #[cfg(any(unix, target_os = "windows"))]
     if let Some(control_socket_path) = ctx_cfg.control_socket_path.take()
         && let Err(e) = start_control_socket(control_socket_path, _vmm.clone())
@@ -3687,6 +3705,51 @@ pub extern "C" fn krun_start_enter(ctx_id: u32) -> i32 {
             }
         }
     }
+}
+
+/// Retrieve the guest RAM regions for the running context `ctx_id` so a caller
+/// sharing this process (e.g. a GPU-forwarding server) can read guest memory
+/// directly at `host_va + (gpa - gpa_start)` for zero-copy transfers.
+///
+/// `regions` is filled with up to `max_regions` triples, each three consecutive
+/// `uint64_t` — `gpa_start`, `host_va`, `len`. `*count` receives the *total*
+/// region count (which may exceed `max_regions`; call again with a larger buffer
+/// if so). Pass `regions == NULL` / `max_regions == 0` to query the count only.
+///
+/// Valid only after `krun_start_enter` has built the VM (call it from another
+/// thread once the guest is up). Returns 0 on success, `-EINVAL` if `count` is
+/// NULL, `-ENOENT` if the context has no published mapping yet.
+///
+/// # Safety
+/// `count` must be a valid writable `uint64_t`; `regions` (if non-NULL) must
+/// point to at least `max_regions * 3` writable `uint64_t`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn krun_get_guest_ram(
+    ctx_id: u32,
+    regions: *mut u64,
+    max_regions: u32,
+    count: *mut u64,
+) -> i32 {
+    if count.is_null() {
+        return -libc::EINVAL;
+    }
+    let map = GUEST_RAM.lock().unwrap();
+    let regs = match map.get(&ctx_id) {
+        Some(r) => r,
+        None => return -libc::ENOENT,
+    };
+    unsafe { *count = regs.len() as u64 };
+    if !regions.is_null() {
+        let n = (max_regions as usize).min(regs.len());
+        for (i, &(gpa, hva, len)) in regs.iter().take(n).enumerate() {
+            unsafe {
+                *regions.add(i * 3) = gpa;
+                *regions.add(i * 3 + 1) = hva;
+                *regions.add(i * 3 + 2) = len;
+            }
+        }
+    }
+    0
 }
 
 #[cfg(feature = "aws-nitro")]
