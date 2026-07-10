@@ -1393,6 +1393,32 @@ int32_t krun_set_root_disk_remount(uint32_t ctx_id, const char *device, const ch
  */
 int32_t krun_start_enter(uint32_t ctx_id);
 
+/**
+ * Retrieves the guest RAM regions for a running context, so a caller sharing
+ * this process (for example, a GPU-forwarding server on another thread) can read
+ * guest memory directly at "host_va + (gpa - gpa_start)" for zero-copy transfers.
+ *
+ * Arguments:
+ *  "ctx_id"      - the configuration context ID (must be running).
+ *  "regions"     - out: array filled with up to "max_regions" triples, each
+ *                  three uint64_t: gpa_start, host_va, len. May be NULL to query
+ *                  the count only.
+ *  "max_regions" - capacity of "regions" in triples.
+ *  "count"       - out: total number of regions (may exceed "max_regions").
+ *
+ * Notes:
+ *  Guest RAM is typically split into a low and a high region around the 4 GiB
+ *  PCI hole. Only valid after "krun_start_enter" has built the microVM; call it
+ *  from a separate thread once the guest is up.
+ *
+ * Returns:
+ *  0        - success.
+ *  -EINVAL  - "count" is NULL.
+ *  -ENOENT  - no mapping is published for "ctx_id" yet.
+ */
+int32_t krun_get_guest_ram(uint32_t ctx_id, uint64_t *regions, uint32_t max_regions,
+                           uint64_t *count);
+
 #ifdef __cplusplus
 }
 #endif

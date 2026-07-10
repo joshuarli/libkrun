@@ -329,6 +329,27 @@ pub struct Vmm {
 }
 
 impl Vmm {
+    /// The guest RAM regions as `(guest_physical_start, host_virtual_addr, len)`
+    /// triples.
+    ///
+    /// Because an embedder-hosted server (e.g. a CUDA forwarding server sharing
+    /// this process) can read guest memory directly at `hva + (gpa - gpa_start)`,
+    /// this is the primitive that enables zero-copy guest↔host transfers: the
+    /// guest ships a guest-physical descriptor instead of the bytes. Guest RAM is
+    /// typically split into a low and a high region around the 4 GiB PCI hole, so
+    /// all regions are returned.
+    pub fn guest_ram_regions(&self) -> Vec<(u64, u64, u64)> {
+        use vm_memory::{Address, GuestMemory, GuestMemoryRegion};
+        self.guest_memory
+            .iter()
+            .filter_map(|r| {
+                let gpa = r.start_addr().raw_value();
+                let hva = self.guest_memory.get_host_address(r.start_addr()).ok()? as u64;
+                Some((gpa, hva, r.len()))
+            })
+            .collect()
+    }
+
     fn wait_for_vcpu_response(
         handle: &VcpuHandle,
         expected: VcpuResponse,
