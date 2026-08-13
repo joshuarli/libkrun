@@ -395,9 +395,22 @@ impl Block {
 
         let mut avail_features = (1u64 << VIRTIO_F_VERSION_1)
             | (1u64 << VIRTIO_BLK_F_SEG_MAX)
-            | (1u64 << VIRTIO_BLK_F_DISCARD)
-            | (1u64 << VIRTIO_BLK_F_WRITE_ZEROES)
             | (1u64 << VIRTIO_RING_F_EVENT_IDX);
+
+        // On macOS a raw guest disk is a regular host file. `imago` implements
+        // DISCARD / WRITE_ZEROES-with-UNMAP by truncating that file when a guest
+        // discards its tail. ext4 legitimately issues those requests, but the
+        // resulting smaller host file no longer matches its recorded geometry
+        // on the next boot. Do not advertise optional unmap operations there.
+        //
+        // This intentionally applies to every macOS block image format. The
+        // safety contract is more important than selectively exposing TRIM for
+        // images whose backing implementation may change.
+        #[cfg(not(target_os = "macos"))]
+        {
+            avail_features |=
+                (1u64 << VIRTIO_BLK_F_DISCARD) | (1u64 << VIRTIO_BLK_F_WRITE_ZEROES);
+        }
 
         if sync_mode != SyncMode::None {
             avail_features |= 1u64 << VIRTIO_BLK_F_FLUSH;
@@ -412,12 +425,24 @@ impl Block {
             size_max: 0,
             // QUEUE_SIZE - 2
             seg_max: 254,
-            max_discard_sectors: u32::MAX,
-            max_discard_seg: 1,
-            discard_sector_alignment: discard_alignment as u32 / 512,
-            max_write_zeroes_sectors: u32::MAX,
-            max_write_zeroes_seg: 1,
-            write_zeroes_may_unmap: 1,
+            max_discard_sectors: if cfg!(target_os = "macos") {
+                0
+            } else {
+                u32::MAX
+            },
+            max_discard_seg: if cfg!(target_os = "macos") { 0 } else { 1 },
+            discard_sector_alignment: if cfg!(target_os = "macos") {
+                0
+            } else {
+                discard_alignment as u32 / 512
+            },
+            max_write_zeroes_sectors: if cfg!(target_os = "macos") {
+                0
+            } else {
+                u32::MAX
+            },
+            max_write_zeroes_seg: if cfg!(target_os = "macos") { 0 } else { 1 },
+            write_zeroes_may_unmap: if cfg!(target_os = "macos") { 0 } else { 1 },
             ..Default::default()
         };
 
@@ -679,5 +704,38 @@ mod overlay_tests {
         );
 
         std::fs::remove_file(&overlay_path).ok();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn raw_disk_does_not_advertise_tail_truncating_unmap_operations() {
+        let disk = TempFile::new().unwrap();
+        disk.as_file().set_len(4 * 1024 * 1024).unwrap();
+        let block = Block::new(
+            "storage".to_owned(),
+            None,
+            CacheType::Unsafe,
+            disk.as_path().to_str().unwrap().to_owned(),
+            ImageType::Raw,
+            false,
+            false,
+            SyncMode::None,
+        )
+        .unwrap();
+
+        assert_eq!(block.avail_features & (1u64 << VIRTIO_BLK_F_DISCARD), 0);
+        assert_eq!(
+            block.avail_features & (1u64 << VIRTIO_BLK_F_WRITE_ZEROES),
+            0
+        );
+        let max_discard_sectors = block.config.max_discard_sectors;
+        let max_discard_seg = block.config.max_discard_seg;
+        let max_write_zeroes_sectors = block.config.max_write_zeroes_sectors;
+        let max_write_zeroes_seg = block.config.max_write_zeroes_seg;
+        assert_eq!(max_discard_sectors, 0);
+        assert_eq!(max_discard_seg, 0);
+        assert_eq!(max_write_zeroes_sectors, 0);
+        assert_eq!(max_write_zeroes_seg, 0);
+        assert_eq!(block.config.write_zeroes_may_unmap, 0);
     }
 }
