@@ -25,8 +25,8 @@ use std::convert::TryInto;
 use std::env;
 use std::ffi::CString;
 use std::ffi::{CStr, c_void};
-use std::fs::File;
-use std::io::IsTerminal;
+use std::fs::{self, File, OpenOptions};
+use std::io::{IsTerminal, Write};
 #[cfg(target_os = "linux")]
 use std::os::fd::AsRawFd;
 #[cfg(unix)]
@@ -35,7 +35,7 @@ use std::os::fd::{BorrowedFd, FromRawFd};
 use std::os::unix::net::UnixListener;
 #[cfg(windows)]
 use std::os::windows::io::BorrowedHandle;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::slice;
 use std::sync::LazyLock;
 use std::sync::Mutex;
@@ -540,8 +540,26 @@ const FORK_MANIFEST_MAGIC: u64 = 0x534d4f4c464f524b;
 /// (gpa/len/memfd-fd/offset + backing-file path) so a clone can reach the
 /// backing RAM — via `/proc/<pid>/fd` on Linux, or the file path on macOS.
 #[cfg(fork_supported)]
+fn write_atomic_file(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let temporary = path.with_extension(format!("{}.tmp", std::process::id()));
+    let mut output = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temporary)?;
+    let write_result = (|| {
+        output.write_all(bytes)?;
+        output.sync_all()?;
+        fs::rename(&temporary, path)
+    })();
+    if write_result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    write_result
+}
+
+#[cfg(fork_supported)]
 fn write_fork_manifest(
-    path: &std::path::Path,
+    path: &Path,
     owner_pid: i32,
     descs: &[vmm::snapshot::MemfdRegionDesc],
 ) -> std::io::Result<()> {
@@ -558,14 +576,12 @@ fn write_fork_manifest(
         buf.extend_from_slice(&(pb.len() as u32).to_le_bytes());
         buf.extend_from_slice(pb);
     }
-    std::fs::write(path, buf)
+    write_atomic_file(path, &buf)
 }
 
 /// Parse a manifest written by [`write_fork_manifest`].
 #[cfg(fork_supported)]
-fn read_fork_manifest(
-    path: &std::path::Path,
-) -> std::io::Result<(i32, Vec<vmm::snapshot::MemfdRegionDesc>)> {
+fn read_fork_manifest(path: &Path) -> std::io::Result<(i32, Vec<vmm::snapshot::MemfdRegionDesc>)> {
     let b = std::fs::read(path)?;
     let err = |m: &str| std::io::Error::new(std::io::ErrorKind::InvalidData, m.to_string());
     let mut p = 0usize;
@@ -604,6 +620,135 @@ fn read_fork_manifest(
         });
     }
     Ok((owner_pid, descs))
+}
+
+/// Promote the file-backed RAM of a frozen macOS fork base into checkpoint-owned
+/// clonefiles. The normal live fork manifest points at the golden's RAM files,
+/// which are valid only while that process remains frozen. This replacement
+/// manifest points instead at APFS clonefiles beneath `dir`, so a later fresh
+/// VMM can restore after the source process exits.
+///
+/// This function deliberately rejects anonymous regions. A durable checkpoint
+/// must be complete; treating an unknown region as fresh zeroed memory would
+/// silently corrupt restored execution.
+#[cfg(all(fork_supported, target_os = "macos"))]
+fn persist_fork_memory(dir: &Path) -> std::io::Result<usize> {
+    use std::collections::BTreeMap;
+    use std::ffi::CString;
+
+    let manifest = dir.join("manifest.bin");
+    let (owner_pid, mut descs) = read_fork_manifest(&manifest)?;
+    if descs.is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "fork manifest has no guest-RAM regions",
+        ));
+    }
+
+    let ram_dir = dir.join("ram");
+    fs::create_dir(&ram_dir)?;
+    let mut cloned_paths: BTreeMap<String, PathBuf> = BTreeMap::new();
+    let mut manifest_published = false;
+    let result = (|| {
+        for descriptor in &mut descs {
+            if descriptor.path.is_empty() || descriptor.fd < 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "durable fork checkpoint requires file-backed guest RAM",
+                ));
+            }
+            let source = Path::new(&descriptor.path);
+            let source_metadata = fs::symlink_metadata(source)?;
+            if !source.is_absolute() || !source_metadata.file_type().is_file() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "fork guest-RAM backing is not a regular file: {}",
+                        source.display()
+                    ),
+                ));
+            }
+
+            let checkpoint_path = match cloned_paths.get(&descriptor.path) {
+                Some(path) => path.clone(),
+                None => {
+                    // The guest is frozen, but its MAP_SHARED RAM writes still
+                    // need to reach the backing file before clonefile takes its
+                    // copy-on-write view.
+                    OpenOptions::new()
+                        .read(true)
+                        .write(true)
+                        .open(source)?
+                        .sync_all()?;
+                    let checkpoint_path = ram_dir.join(format!("{:04x}.ram", cloned_paths.len()));
+                    let source_c =
+                        CString::new(source.as_os_str().as_encoded_bytes()).map_err(|_| {
+                            std::io::Error::new(
+                                std::io::ErrorKind::InvalidInput,
+                                "guest-RAM path contains NUL",
+                            )
+                        })?;
+                    let checkpoint_c = CString::new(checkpoint_path.as_os_str().as_encoded_bytes())
+                        .map_err(|_| {
+                            std::io::Error::new(
+                                std::io::ErrorKind::InvalidInput,
+                                "checkpoint RAM path contains NUL",
+                            )
+                        })?;
+                    // SAFETY: both C strings are NUL-terminated absolute local
+                    // paths. The destination is unique inside a newly-created
+                    // checkpoint directory.
+                    if unsafe { libc::clonefile(source_c.as_ptr(), checkpoint_c.as_ptr(), 0) } != 0
+                    {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    OpenOptions::new()
+                        .read(true)
+                        .write(true)
+                        .open(&checkpoint_path)?
+                        .sync_all()?;
+                    cloned_paths.insert(descriptor.path.clone(), checkpoint_path.clone());
+                    checkpoint_path
+                }
+            };
+            descriptor.path = checkpoint_path
+                .to_str()
+                .ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "checkpoint RAM path is not UTF-8",
+                    )
+                })?
+                .to_string();
+        }
+        File::open(&ram_dir)?.sync_all()?;
+        // The owner PID remains the frozen source for diagnostic compatibility,
+        // but restore on macOS opens only the checkpoint-owned backing paths.
+        write_fork_manifest(&manifest, owner_pid, &descs)?;
+        manifest_published = true;
+        File::open(dir)?.sync_all()?;
+        Ok(descs.len())
+    })();
+
+    // Once the replacement manifest has been published it must retain its RAM
+    // clonefiles, even if the final directory fsync reports an error. The
+    // caller owns the staging directory and may roll it back as one unit; this
+    // helper must never leave a manifest pointing at paths it just deleted.
+    if result.is_err() && !manifest_published {
+        let _ = fs::remove_dir_all(&ram_dir);
+    }
+    result
+}
+
+#[cfg(all(fork_supported, target_os = "macos"))]
+fn handle_persist_fork_memory(dir: &str) -> String {
+    if dir.is_empty() {
+        return "ERR EINVAL fork snapshot dir required\n".to_string();
+    }
+    match persist_fork_memory(Path::new(dir)) {
+        Ok(regions) => format!("OK durable fork RAM persisted ({regions} regions)\n"),
+        Err(error) => format!("ERR EIO persist fork RAM: {error}\n"),
+    }
 }
 
 #[cfg(fork_supported)]
@@ -662,12 +807,15 @@ fn handle_fork(vmm: &Arc<Mutex<vmm::Vmm>>, dir: &str) -> String {
         }
         Err(e) => return format!("ERR EIO fork checkpoint failed: {e}\n"),
     };
-    if let Err(e) = std::fs::write(dir.join("checkpoint.bin"), checkpoint.serialize()) {
+    if let Err(e) = write_atomic_file(&dir.join("checkpoint.bin"), &checkpoint.serialize()) {
         return rollback_failed_fork(vmm, dir, checkpoint, format!("write checkpoint: {e}"));
     }
     let pid = std::process::id() as i32;
     if let Err(e) = write_fork_manifest(&dir.join("manifest.bin"), pid, &descs) {
         return rollback_failed_fork(vmm, dir, checkpoint, format!("write manifest: {e}"));
+    }
+    if let Err(e) = File::open(dir).and_then(|directory| directory.sync_all()) {
+        return rollback_failed_fork(vmm, dir, checkpoint, format!("sync checkpoint dir: {e}"));
     }
     format!(
         "OK forked (frozen base, pid {pid}, {} regions)\n",
@@ -815,6 +963,13 @@ fn handle_control_stream<S: std::io::Read + std::io::Write>(
                 // (SMOLVM_FORKABLE=1).
                 #[cfg(fork_supported)]
                 "FORK" => handle_fork(vmm, _arg),
+                // PERSIST_FORK_MEMORY <dir>: after FORK has frozen the source,
+                // replace macOS live-RAM paths in its manifest with
+                // checkpoint-owned APFS clonefiles. The source remains frozen;
+                // the caller must still persist its block state and either
+                // resume or retire it transactionally.
+                #[cfg(all(fork_supported, target_os = "macos"))]
+                "PERSIST_FORK_MEMORY" => handle_persist_fork_memory(_arg),
                 #[cfg(fork_supported)]
                 "ROLLBACK_FORK" => handle_rollback_fork(vmm, _arg),
                 _ => "ERR EINVAL unknown command\n".to_string(),
@@ -839,6 +994,59 @@ mod control_command_tests {
         let oversized = vec![b'x'; MAX_CONTROL_COMMAND_BYTES + 1];
         let error = read_control_command(&mut oversized.as_slice()).unwrap_err();
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[cfg(all(fork_supported, target_os = "macos"))]
+    #[test]
+    fn persist_fork_memory_replaces_live_ram_paths_with_owned_clonefiles() {
+        use std::io::Write;
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        static SERIAL: AtomicU64 = AtomicU64::new(0);
+        let serial = SERIAL.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "libkrun-durable-fork-{}-{serial}",
+            std::process::id()
+        ));
+        let result = (|| -> std::io::Result<()> {
+            fs::create_dir(&root)?;
+            let source = root.join("golden.ram");
+            let mut source_file = File::create(&source)?;
+            source_file.write_all(b"guest ram before durable fork")?;
+            source_file.sync_all()?;
+
+            let checkpoint = root.join("checkpoint");
+            fs::create_dir(&checkpoint)?;
+            let desc = vmm::snapshot::MemfdRegionDesc {
+                gpa: 0x4000,
+                len: 4096,
+                fd: 0,
+                offset: 0,
+                path: source.to_string_lossy().into_owned(),
+            };
+            write_fork_manifest(&checkpoint.join("manifest.bin"), 123, &[desc])?;
+
+            assert_eq!(persist_fork_memory(&checkpoint)?, 1);
+            let (_, persisted) = read_fork_manifest(&checkpoint.join("manifest.bin"))?;
+            assert_eq!(persisted.len(), 1);
+            let source_path = source.to_string_lossy().into_owned();
+            let checkpoint_path = checkpoint.to_string_lossy();
+            assert_ne!(persisted[0].path, source_path);
+            assert!(persisted[0].path.starts_with(checkpoint_path.as_ref()));
+            assert_eq!(
+                fs::read(&persisted[0].path)?,
+                b"guest ram before durable fork"
+            );
+
+            fs::remove_file(source)?;
+            assert_eq!(
+                fs::read(&persisted[0].path)?,
+                b"guest ram before durable fork"
+            );
+            Ok(())
+        })();
+        let _ = fs::remove_dir_all(root);
+        result.unwrap();
     }
 }
 
@@ -2510,7 +2718,9 @@ pub unsafe extern "C" fn krun_set_control_socket(ctx_id: u32, c_socket_path: *co
 /// restores VM/device/vCPU state instead of cold-booting. The rest of the
 /// context (rootfs, vsock socket, mem/cpu config) must be configured to match
 /// the golden VM, with fresh host-side resources (a new vsock socket, etc.).
-/// Linux/x86_64 only.
+/// On macOS, callers that need the clone to outlive its frozen golden must send
+/// `PERSIST_FORK_MEMORY <dir>` before retiring that golden. This replaces the
+/// live-RAM paths in `manifest.bin` with checkpoint-owned APFS clonefiles.
 #[allow(clippy::missing_safety_doc)]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn krun_set_snapshot(ctx_id: u32, c_snapshot_dir: *const c_char) -> i32 {
