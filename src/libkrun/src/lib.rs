@@ -622,11 +622,53 @@ fn read_fork_manifest(path: &Path) -> std::io::Result<(i32, Vec<vmm::snapshot::M
     Ok((owner_pid, descs))
 }
 
+/// Resolve only the checkpoint-owned relative RAM spelling emitted by
+/// [`persist_fork_memory`]. Live fork manifests retain absolute backing paths;
+/// a durable manifest may use exactly `ram/<four-hex>.ram` beneath its own
+/// checkpoint root so the whole artifact remains valid after an atomic rename.
+#[cfg(fork_supported)]
+fn resolve_checkpoint_ram_paths(
+    dir: &Path,
+    descs: &mut [vmm::snapshot::MemfdRegionDesc],
+) -> std::result::Result<(), String> {
+    for descriptor in descs {
+        let path = Path::new(&descriptor.path);
+        if path.is_absolute() {
+            continue;
+        }
+        let mut components = path.components();
+        let valid = matches!(components.next(), Some(std::path::Component::Normal(root)) if root == "ram")
+            && matches!(components.next(), Some(std::path::Component::Normal(file)) if is_checkpoint_ram_filename(file))
+            && components.next().is_none();
+        if !valid {
+            return Err(format!(
+                "durable fork manifest contains unsafe relative RAM path: {}",
+                path.display()
+            ));
+        }
+        descriptor.path = dir
+            .join(path)
+            .to_str()
+            .ok_or_else(|| "checkpoint RAM path is not UTF-8".to_string())?
+            .to_string();
+    }
+    Ok(())
+}
+
+#[cfg(fork_supported)]
+fn is_checkpoint_ram_filename(file: &std::ffi::OsStr) -> bool {
+    let bytes = file.as_encoded_bytes();
+    bytes.len() == 8 && bytes[4..] == *b".ram" && bytes[..4].iter().all(u8::is_ascii_hexdigit)
+}
+
 /// Promote the file-backed RAM of a frozen macOS fork base into checkpoint-owned
 /// clonefiles. The normal live fork manifest points at the golden's RAM files,
 /// which are valid only while that process remains frozen. This replacement
-/// manifest points instead at APFS clonefiles beneath `dir`, so a later fresh
-/// VMM can restore after the source process exits.
+/// manifest points instead at APFS clonefiles beneath `dir`, recorded as
+/// checkpoint-root-relative `ram/...` paths. The relative representation is
+/// essential: callers publish a complete checkpoint by renaming its staging
+/// directory, and an absolute staging path would turn that atomic publish into
+/// a manifest full of dangling RAM references.
 ///
 /// This function deliberately rejects anonymous regions. A durable checkpoint
 /// must be complete; treating an unknown region as fresh zeroed memory would
@@ -647,7 +689,7 @@ fn persist_fork_memory(dir: &Path) -> std::io::Result<usize> {
 
     let ram_dir = dir.join("ram");
     fs::create_dir(&ram_dir)?;
-    let mut cloned_paths: BTreeMap<String, PathBuf> = BTreeMap::new();
+    let mut cloned_paths: BTreeMap<String, String> = BTreeMap::new();
     let mut manifest_published = false;
     let result = (|| {
         for descriptor in &mut descs {
@@ -669,7 +711,7 @@ fn persist_fork_memory(dir: &Path) -> std::io::Result<usize> {
                 ));
             }
 
-            let checkpoint_path = match cloned_paths.get(&descriptor.path) {
+            let manifest_path = match cloned_paths.get(&descriptor.path) {
                 Some(path) => path.clone(),
                 None => {
                     // The guest is frozen, but its MAP_SHARED RAM writes still
@@ -707,19 +749,12 @@ fn persist_fork_memory(dir: &Path) -> std::io::Result<usize> {
                         .write(true)
                         .open(&checkpoint_path)?
                         .sync_all()?;
-                    cloned_paths.insert(descriptor.path.clone(), checkpoint_path.clone());
-                    checkpoint_path
+                    let manifest_path = format!("ram/{:04x}.ram", cloned_paths.len());
+                    cloned_paths.insert(descriptor.path.clone(), manifest_path.clone());
+                    manifest_path
                 }
             };
-            descriptor.path = checkpoint_path
-                .to_str()
-                .ok_or_else(|| {
-                    std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        "checkpoint RAM path is not UTF-8",
-                    )
-                })?
-                .to_string();
+            descriptor.path = manifest_path;
         }
         File::open(&ram_dir)?.sync_all()?;
         // The owner PID remains the frozen source for diagnostic compatibility,
@@ -856,8 +891,9 @@ fn handle_rollback_fork(vmm: &Arc<Mutex<vmm::Vmm>>, dir: &str) -> String {
 fn build_restore_ctx(
     dir: &std::path::Path,
 ) -> std::result::Result<vmm::builder::RestoreCtx, String> {
-    let (_owner_pid, descs) =
+    let (_owner_pid, mut descs) =
         read_fork_manifest(&dir.join("manifest.bin")).map_err(|e| format!("manifest: {e}"))?;
+    resolve_checkpoint_ram_paths(dir, &mut descs)?;
     let checkpoint =
         std::fs::read(dir.join("checkpoint.bin")).map_err(|e| format!("checkpoint: {e}"))?;
     #[cfg(target_os = "linux")]
@@ -1030,17 +1066,21 @@ mod control_command_tests {
             let (_, persisted) = read_fork_manifest(&checkpoint.join("manifest.bin"))?;
             assert_eq!(persisted.len(), 1);
             let source_path = source.to_string_lossy().into_owned();
-            let checkpoint_path = checkpoint.to_string_lossy();
             assert_ne!(persisted[0].path, source_path);
-            assert!(persisted[0].path.starts_with(checkpoint_path.as_ref()));
+            assert_eq!(persisted[0].path, "ram/0000.ram");
             assert_eq!(
-                fs::read(&persisted[0].path)?,
+                fs::read(checkpoint.join(&persisted[0].path))?,
                 b"guest ram before durable fork"
             );
 
             fs::remove_file(source)?;
+            let published = root.join("published");
+            fs::rename(&checkpoint, &published)?;
+            let (_, mut restored) = read_fork_manifest(&published.join("manifest.bin"))?;
+            resolve_checkpoint_ram_paths(&published, &mut restored)
+                .map_err(std::io::Error::other)?;
             assert_eq!(
-                fs::read(&persisted[0].path)?,
+                fs::read(&restored[0].path)?,
                 b"guest ram before durable fork"
             );
             Ok(())
