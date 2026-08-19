@@ -97,7 +97,7 @@ ifeq ($(PREFIX),)
     PREFIX := /usr/local
 endif
 
-.PHONY: install clean test test-prefix $(LIBRARY_RELEASE_$(OS)) $(LIBRARY_DEBUG_$(OS)) libkrun.pc clean-sysroot clean-all
+.PHONY: install clean unit-test test test-prefix $(LIBRARY_RELEASE_$(OS)) $(LIBRARY_DEBUG_$(OS)) libkrun.pc clean-sysroot clean-all
 
 all: $(LIBRARY_RELEASE_$(OS)) libkrun.pc
 
@@ -291,6 +291,21 @@ test-prefix: test-prefix/$(LIBDIR_$(OS))/libkrun.pc
 
 TEST ?= all
 TEST_FLAGS ?=
+
+# Run the libkrun unit and documentation suites. On macOS, this target also
+# prepares the Homebrew LLVM path and the musl cross-linker variables exported
+# above, so callers do not need to reproduce the local toolchain environment.
+unit-test:
+ifeq ($(OS),Darwin)
+	@set -eu; \
+	command -v brew >/dev/null || { echo "libkrun: unit-test requires Homebrew on macOS" >&2; exit 1; }; \
+	brew list --versions llvm >/dev/null 2>&1 || brew install llvm; \
+	llvm_prefix="$$(brew --prefix llvm)"; \
+	test -f "$$llvm_prefix/lib/libclang.dylib" || { echo "libkrun: Homebrew LLVM has no libclang.dylib" >&2; exit 1; }; \
+	PATH="$$llvm_prefix/bin:$$PATH" LIBCLANG_PATH="$$llvm_prefix/lib" cargo test
+else
+	cargo test
+endif
 
 # Extra library paths needed for tests (libkrunfw, llvm)
 EXTRA_LIBPATH_Linux =
