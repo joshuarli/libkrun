@@ -1,7 +1,11 @@
 use std::env;
 use std::path::PathBuf;
 
+#[path = "../../build_support/libclang.rs"]
+mod libclang;
+
 fn main() {
+    libclang::ensure();
     let bindings = bindgen::Builder::default()
         .header("libkrun_display.h")
         .parse_callbacks(Box::new(bindgen::CargoCallbacks::new()))

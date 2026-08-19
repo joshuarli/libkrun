@@ -17,4 +17,5 @@ static_assertions = "1.1.0"
 bindgen = { version = "0.72", default-features = false }
 
 [features]
+default = ["bindgen_clang_runtime"]
 bindgen_clang_runtime = ["bindgen/runtime"]
