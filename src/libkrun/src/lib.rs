@@ -902,6 +902,13 @@ fn build_restore_ctx(
     #[cfg(any(target_os = "macos", target_os = "windows"))]
     let guest_memory = vmm::snapshot::open_cow_memory_from_paths(&descs)
         .map_err(|e| format!("cow-map guest memory: {e}"))?;
+    #[cfg(fork_supported)]
+    let guest_memory = if std::env::var_os("SMOLVM_FORKABLE").is_some_and(|value| value == "1") {
+        vmm::snapshot::rebase_restored_memory_as_forkable(&guest_memory)
+            .map_err(|e| format!("rebase restored guest memory as forkable: {e}"))?
+    } else {
+        guest_memory
+    };
     Ok(vmm::builder::RestoreCtx {
         guest_memory,
         checkpoint,

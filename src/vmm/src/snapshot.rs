@@ -119,6 +119,37 @@ pub fn copy_guest_memory(src: &GuestMemoryMmap, dst: &GuestMemoryMmap) -> io::Re
     Ok(())
 }
 
+/// Rebase a restored CoW guest-memory image into freshly allocated,
+/// file-backed fork-base memory. A cross-process restore maps the previous
+/// checkpoint's backing files privately, which deliberately has no retained
+/// `FileOffset` in `GuestMemoryMmap`; it can resume work but cannot become the
+/// source of a later fork. Rebase copies the exact paused image into new
+/// forkable ranges so a durable continuation can establish its own lineage
+/// without keeping the preceding checkpoint source alive.
+#[cfg(fork_supported)]
+pub fn rebase_restored_memory_as_forkable(
+    source: &GuestMemoryMmap,
+) -> io::Result<GuestMemoryMmap> {
+    use vm_memory::FileOffset;
+
+    let ranges = source
+        .iter()
+        .map(|region| {
+            let size = region.len() as usize;
+            let file = crate::builder::create_guest_ram_memfd(size).map_err(io::Error::other)?;
+            Ok((
+                region.start_addr(),
+                size,
+                Some(FileOffset::new(file, 0)),
+            ))
+        })
+        .collect::<io::Result<Vec<_>>>()?;
+    let rebased = GuestMemoryMmap::from_ranges_with_files(ranges)
+        .map_err(|error| io::Error::other(format!("create forkable memory ranges: {error:?}")))?;
+    copy_guest_memory(source, &rebased)?;
+    Ok(rebased)
+}
+
 /// Copy-on-write clone of a `memfd`-backed guest memory image — the core of
 /// fast, dense VM **fork** (plan §4/§9a). Each `memfd`-backed RAM region is
 /// re-mapped `MAP_PRIVATE`, so the clone shares the parent's clean physical
@@ -587,6 +618,44 @@ mod tests {
         dst.read_slice(&mut got_hi, GuestAddress(0x100000)).unwrap();
         assert_eq!(got_lo, vec![0xAB; 0x10000]);
         assert_eq!(got_hi, vec![0xCD; 0x8000]);
+    }
+
+    #[cfg(fork_supported)]
+    #[test]
+    fn restored_memory_rebases_into_a_new_forkable_base() {
+        let source = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap();
+        source
+            .write_slice(&[0xA5; 0x10000], GuestAddress(0))
+            .unwrap();
+
+        let rebased = rebase_restored_memory_as_forkable(&source).expect("rebase restored RAM");
+        let mut observed = vec![0; 16];
+        rebased.read_slice(&mut observed, GuestAddress(0)).unwrap();
+        assert_eq!(observed, vec![0xA5; 16]);
+        assert!(
+            memfd_region_descs(&rebased)
+                .iter()
+                .all(|descriptor| descriptor.fd >= 0),
+            "every rebased region must retain a file descriptor/path for its next fork"
+        );
+
+        source.write_slice(&[0x5A; 16], GuestAddress(0)).unwrap();
+        rebased.read_slice(&mut observed, GuestAddress(0)).unwrap();
+        assert_eq!(
+            observed,
+            vec![0xA5; 16],
+            "rebased continuation owns a copied snapshot rather than its predecessor's mapping"
+        );
+        rebased.write_slice(&[0x3C; 16], GuestAddress(0)).unwrap();
+        let mut source_observed = vec![0; 16];
+        source
+            .read_slice(&mut source_observed, GuestAddress(0))
+            .unwrap();
+        assert_eq!(
+            source_observed,
+            vec![0x5A; 16],
+            "writes in the rehydrated fork base must not alter its restored source mapping"
+        );
     }
 
     // The CoW fork primitive: a clone shares the parent's clean pages but is
